@@ -12,6 +12,9 @@
 
 #include "audio_service.h"
 #include "wake_words/custom_wake_word.h"
+#if CONFIG_USE_MICRO_WAKE_WORD
+#include "wake_words/micro_wake_word.h"
+#endif
 
 #define TAG "AfeAudioEngine"
 
@@ -25,6 +28,9 @@ AfeAudioEngine::AfeAudioEngine() { event_group_ = xEventGroupCreate(); }
 
 AfeAudioEngine::~AfeAudioEngine() {
     custom_wake_word_.reset();
+#if CONFIG_USE_MICRO_WAKE_WORD
+    micro_wake_word_.reset();
+#endif
     if (afe_data_ != nullptr) {
         afe_iface_->destroy(afe_data_);
     }
@@ -79,6 +85,27 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
             ESP_LOGI(TAG, "Model %d: %s", i, models_->model_name[i]);
         }
     }
+
+#if CONFIG_USE_MICRO_WAKE_WORD
+    // microWakeWord replaces WakeNet/MultiNet; the AFE is kept for AEC/VAD only.
+    wakenet_model_name = nullptr;
+    multinet_model_name = nullptr;
+    wake_detector_ = WakeDetector::kMicroWakeWord;
+    micro_wake_word_ = std::make_unique<MicroWakeWord>();
+    micro_wake_word_->OnWakeWordDetected([this](const std::string& wake_word) {
+        last_detected_wake_word_ = wake_word;
+        xEventGroupClearBits(event_group_, kWakeWordEnabled);
+        UpdateActiveState();
+        if (wake_word_detected_callback_) {
+            wake_word_detected_callback_(wake_word);
+        }
+    });
+    if (!micro_wake_word_->Initialize(codec_, models_)) {
+        ESP_LOGE(TAG, "Failed to initialize microWakeWord detector");
+        micro_wake_word_.reset();
+        wake_detector_ = WakeDetector::kNone;
+    }
+#endif
 
     if (multinet_model_name != nullptr) {
         wake_detector_ = WakeDetector::kMultiNet;
@@ -243,9 +270,10 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
         return false;
     }
 
-    const char* detector = wake_detector_ == WakeDetector::kWakeNet
-                               ? "WakeNet"
-                               : (wake_detector_ == WakeDetector::kMultiNet ? "MultiNet" : "none");
+    const char* detector = wake_detector_ == WakeDetector::kWakeNet       ? "WakeNet"
+                           : wake_detector_ == WakeDetector::kMultiNet    ? "MultiNet"
+                           : wake_detector_ == WakeDetector::kMicroWakeWord ? "microWakeWord"
+                                                                          : "none";
     ESP_LOGI(TAG, "Initialized FD AFE, detector: %s, NS: off, feed: %d, fetch: %d", detector,
              afe_iface_->get_feed_chunksize(afe_data_), afe_iface_->get_fetch_chunksize(afe_data_));
     ESP_LOGI(TAG, "After AFE create: free=%u min=%u largest=%u",
@@ -287,12 +315,22 @@ void AfeAudioEngine::EnableWakeWordDetection(bool enable) {
         if (wake_detector_ == WakeDetector::kMultiNet) {
             custom_wake_word_->Start();
         }
+#if CONFIG_USE_MICRO_WAKE_WORD
+        if (wake_detector_ == WakeDetector::kMicroWakeWord) {
+            micro_wake_word_->Start();
+        }
+#endif
         xEventGroupSetBits(event_group_, kWakeWordEnabled);
     } else {
         xEventGroupClearBits(event_group_, kWakeWordEnabled);
         if (wake_detector_ == WakeDetector::kMultiNet) {
             custom_wake_word_->Stop();
         }
+#if CONFIG_USE_MICRO_WAKE_WORD
+        if (wake_detector_ == WakeDetector::kMicroWakeWord) {
+            micro_wake_word_->Stop();
+        }
+#endif
     }
     UpdateActiveState();
 }
@@ -318,6 +356,11 @@ void AfeAudioEngine::EnableDeviceAec(bool enable) {
 bool AfeAudioEngine::HasWakeWord() const { return wake_detector_ != WakeDetector::kNone; }
 
 std::vector<std::string> AfeAudioEngine::GetWakeWords() const {
+#if CONFIG_USE_MICRO_WAKE_WORD
+    if (micro_wake_word_) {
+        return micro_wake_word_->GetWakeWords();
+    }
+#endif
     return custom_wake_word_ ? custom_wake_word_->GetWakeWords() : wake_words_;
 }
 
@@ -452,6 +495,13 @@ void AfeAudioEngine::ProcessingTask() {
 }
 
 void AfeAudioEngine::HandleWakeWordResult(const afe_fetch_result_t* result) {
+#if CONFIG_USE_MICRO_WAKE_WORD
+    if (wake_detector_ == WakeDetector::kMicroWakeWord) {
+        // Same feed point as MultiNet: AEC-processed mono 16 kHz AFE output.
+        micro_wake_word_->FeedMono(result->data, result->data_size / sizeof(int16_t));
+        return;
+    }
+#endif
     if (wake_detector_ == WakeDetector::kMultiNet) {
         custom_wake_word_->FeedMono(result->data, result->data_size / sizeof(int16_t));
         return;

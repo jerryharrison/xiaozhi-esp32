@@ -41,6 +41,19 @@ dependencies:
   espressif/led_strip: ~3.0.3
   espressif/esp_codec_dev: ~1.6.2
   espressif/esp-sr: ==2.4.7
+  # Skipper Pod: microWakeWord ("Hey Skipper") runtime, same versions ESPHome pins
+  espressif/esp-tflite-micro:
+    version: ~1.4.1
+    rules:
+    - if: target in [esp32s3, esp32p4]
+  espressif/esp-nn:
+    version: ~1.5.0
+    rules:
+    - if: target in [esp32s3, esp32p4]
+  esphome/esp-micro-speech-features:
+    version: ==1.2.3
+    rules:
+    - if: target in [esp32s3, esp32p4]
   espressif/button: ~4.2.1
   espressif/knob: ^1.1.0
   esphome/esp-hub75:

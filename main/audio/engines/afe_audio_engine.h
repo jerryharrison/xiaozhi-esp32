@@ -19,6 +19,7 @@
 #include "wake_words/wake_word_audio_cache.h"
 
 class CustomWakeWord;
+class MicroWakeWord;
 
 class AfeAudioEngine : public AudioEngine {
 public:
@@ -52,12 +53,18 @@ private:
         kNone,
         kWakeNet,
         kMultiNet,
+        kMicroWakeWord,
     };
 
     static constexpr EventBits_t kWakeWordEnabled = 1 << 0;
     static constexpr EventBits_t kVoiceProcessingEnabled = 1 << 1;
     static constexpr EventBits_t kAfeActive = 1 << 2;
+#if CONFIG_USE_MICRO_WAKE_WORD
+    // TFLM inference + frontend run inline in the AFE task.
+    static constexpr size_t kProcessingTaskStackSize = 8192;
+#else
     static constexpr size_t kProcessingTaskStackSize = 4096;
+#endif
 
     AudioCodec* codec_ = nullptr;
     srmodel_list_t* models_ = nullptr;
@@ -83,6 +90,7 @@ private:
     WakeDetector wake_detector_ = WakeDetector::kNone;
 
     std::unique_ptr<CustomWakeWord> custom_wake_word_;
+    std::unique_ptr<MicroWakeWord> micro_wake_word_;
     std::vector<std::string> wake_words_;
     std::string last_detected_wake_word_;
     std::vector<int16_t> input_buffer_;

@@ -1018,6 +1018,17 @@ choice WAKE_WORD_TYPE
         help
             Requires ESP32-S3, ESP32-P4, or ESP32-S31 and PSRAM
 
+    config USE_MICRO_WAKE_WORD
+        bool "microWakeWord model (TFLite Micro) with AFE"
+        depends on (IDF_TARGET_ESP32S3 || IDF_TARGET_ESP32P4) && SPIRAM
+        help
+            Runs an ESPHome/microWakeWord v2 streaming model with TensorFlow Lite
+            Micro on the AFE (AEC) output. No WakeNet/MultiNet models are packaged.
+            The model and its manifest are embedded from
+            main/audio/wake_words/models/micro_wake_word.{tflite,json}; the
+            manifest supplies the wake word text, probability cutoff, sliding
+            window and feature step. See SKIPPER.md.
+
 endchoice
 
 config CUSTOM_WAKE_WORD
@@ -1052,7 +1063,7 @@ config SEND_WAKE_WORD_DATA
 config WAKE_WORD_DETECTION_IN_LISTENING
     bool "Enable Wake Word Detection in Listening Mode"
     default n
-    depends on USE_AFE_WAKE_WORD || USE_CUSTOM_WAKE_WORD
+    depends on USE_AFE_WAKE_WORD || USE_CUSTOM_WAKE_WORD || USE_MICRO_WAKE_WORD
     help
         Enable wake word detection while in listening mode.
         When enabled, the device can detect wake word during listening,
