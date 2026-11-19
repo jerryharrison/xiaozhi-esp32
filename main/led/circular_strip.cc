@@ -180,6 +180,30 @@ void CircularStrip::SetBrightness(uint8_t default_brightness, uint8_t low_bright
     OnStateChanged();
 }
 
+// Skipper: soft comet that circles the ring (thinking)
+void CircularStrip::Swirl(int interval_ms) {
+    swirl_pos_ = 0;
+    StartStripTask(interval_ms, [this]() {
+        static const uint8_t tail[] = {28, 12, 5, 2};
+        for (int i = 0; i < max_leds_; i++) colors_[i] = {0, 0, 0};
+        for (int k = 0; k < 4 && k < max_leds_; k++) {
+            int i = (swirl_pos_ - k + max_leds_) % max_leds_;
+            uint8_t v = tail[k];
+            colors_[i] = { v, (uint8_t)(v * 3 / 4), (uint8_t)(v / 2) };  // warm white
+        }
+        for (int i = 0; i < max_leds_; i++)
+            led_strip_set_pixel(led_strip_, i, colors_[i].red, colors_[i].green, colors_[i].blue);
+        led_strip_refresh(led_strip_);
+        swirl_pos_ = (swirl_pos_ + 1) % max_leds_;
+    });
+}
+
+void CircularStrip::SetThinking(bool thinking) {
+    if (thinking_ == thinking) return;
+    thinking_ = thinking;
+    OnStateChanged();
+}
+
 void CircularStrip::OnStateChanged() {
     auto& app = Application::GetInstance();
     auto device_state = app.GetDeviceState();
@@ -196,23 +220,33 @@ void CircularStrip::OnStateChanged() {
             break;
         }
         case kDeviceStateIdle:
+            thinking_ = false;
             FadeOut(50);
             break;
         case kDeviceStateConnecting: {
-            StripColor color = { low_brightness_, low_brightness_, default_brightness_ };
+            // Skipper: dim warm glow while the connection opens
+            StripColor color = { 8, 6, 4 };
             SetAllColor(color);
             break;
         }
         case kDeviceStateListening:
         case kDeviceStateAudioTesting: {
-            StripColor color = { default_brightness_, low_brightness_, low_brightness_ };
+            // Skipper: soft warm white = "I'm listening"
+            thinking_ = false;
+            StripColor color = { 28, 22, 14 };
             SetAllColor(color);
             break;
         }
         case kDeviceStateSpeaking:
         case kDeviceStateNotifying: {
-            StripColor color = { low_brightness_, default_brightness_, low_brightness_ };
-            SetAllColor(color);
+            if (thinking_) {
+                Swirl(110);
+            } else {
+                // Skipper: gentle breathing glow while talking
+                StripColor low = { 6, 5, 3 };
+                StripColor high = { 22, 17, 11 };
+                Breathe(low, high, 40);
+            }
             break;
         }
         case kDeviceStateUpgrading: {

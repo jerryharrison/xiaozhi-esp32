@@ -6,6 +6,8 @@ public:
     virtual ~Led() = default;
     // Set the led state based on the device state
     virtual void OnStateChanged() = 0;
+    // Skipper: server-driven "thinking" hint (shown while waiting for the reply)
+    virtual void SetThinking(bool thinking) {}
 };
 
 

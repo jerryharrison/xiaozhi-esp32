@@ -710,7 +710,13 @@ void Application::InitializeProtocol() {
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(emotion)) {
                 Schedule([display, emotion_str = std::string(emotion->valuestring)]() {
-                    display->SetEmotion(emotion_str.c_str());
+                    auto led = Board::GetInstance().GetLed();
+                    if (emotion_str == "thinking") {
+                        led->SetThinking(true);
+                    } else {
+                        led->SetThinking(false);
+                        display->SetEmotion(emotion_str.c_str());
+                    }
                 });
             }
         } else if (strcmp(type->valuestring, "mcp") == 0) {

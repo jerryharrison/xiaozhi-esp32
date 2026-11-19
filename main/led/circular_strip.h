@@ -24,6 +24,7 @@ public:
     virtual ~CircularStrip();
 
     void OnStateChanged() override;
+    void SetThinking(bool thinking) override;
     void SetBrightness(uint8_t default_brightness, uint8_t low_brightness);
     void SetAllColor(StripColor color);
     void SetSingleColor(uint8_t index, StripColor color);
@@ -52,6 +53,9 @@ private:
     bool       breathe_up_      = true;
     StripColor breathe_color_   = {};
     int        scroll_offset_   = 0;
+    bool       thinking_        = false;
+    int        swirl_pos_       = 0;
+    void Swirl(int interval_ms);
 
     void StartStripTask(int interval_ms, std::function<void()> cb);
     void Rainbow(StripColor low, StripColor high, int interval_ms);
