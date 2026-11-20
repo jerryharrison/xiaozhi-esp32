@@ -25,6 +25,7 @@ public:
 
     void OnStateChanged() override;
     void SetThinking(bool thinking) override;
+    void ShowError() override;
     void SetBrightness(uint8_t default_brightness, uint8_t low_brightness);
     void SetAllColor(StripColor color);
     void SetSingleColor(uint8_t index, StripColor color);
@@ -56,6 +57,15 @@ private:
     bool       thinking_        = false;
     int        swirl_pos_       = 0;
     void Swirl(int interval_ms);
+
+    // Skipper status colors: red for errors, green once after boot, then dark.
+    std::atomic<int64_t> error_until_us_{0};
+    int64_t    ready_until_us_  = 0;
+    bool       ready_shown_     = false;
+    int        hold_ticks_      = 0;
+    int        dark_ticks_      = 0;
+    void HoldThenDark(StripColor color, int64_t until_us);
+    bool ErrorActive() const;
 
     void StartStripTask(int interval_ms, std::function<void()> cb);
     void Rainbow(StripColor low, StripColor high, int interval_ms);

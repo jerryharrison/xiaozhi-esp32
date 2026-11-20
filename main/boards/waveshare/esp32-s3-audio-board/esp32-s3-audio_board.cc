@@ -212,7 +212,9 @@ public:
     }
 
     virtual Led* GetLed() override {
-        static CircularStrip led(BUILTIN_LED_GPIO, 6);
+        // Skipper: the board has 7 WS2812s (U19 + U9..U14); driving only 6 left the last one
+        // unmanaged, so it could latch on after a glitch and never turn off.
+        static CircularStrip led(BUILTIN_LED_GPIO, 7);
         return &led;
     }
 

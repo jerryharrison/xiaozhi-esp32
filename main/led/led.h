@@ -8,6 +8,8 @@ public:
     virtual void OnStateChanged() = 0;
     // Skipper: server-driven "thinking" hint (shown while waiting for the reply)
     virtual void SetThinking(bool thinking) {}
+    // Skipper: an error alert was raised (shown briefly in red)
+    virtual void ShowError() {}
 };
 
 

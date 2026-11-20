@@ -796,6 +796,9 @@ void Application::ShowActivationCode(const std::string& code, const std::string&
 void Application::Alert(const char* status, const char* message, const char* emotion,
                         const std::string_view& sound) {
     ESP_LOGW(TAG, "Alert [%s] %s: %s", emotion, status, message);
+    if (status != nullptr && strcmp(status, Lang::Strings::ERROR) == 0) {
+        Board::GetInstance().GetLed()->ShowError();  // Skipper: red ring for errors
+    }
     auto display = Board::GetInstance().GetDisplay();
     display->SetStatus(status);
     display->SetEmotion(emotion);

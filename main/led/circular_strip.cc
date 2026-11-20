@@ -97,7 +97,17 @@ void CircularStrip::Blink(StripColor color, int interval_ms) {
 }
 
 void CircularStrip::FadeOut(int interval_ms) {
+    dark_ticks_ = 0;
     StartStripTask(interval_ms, [this]() {
+        // Skipper: once dark, keep re-sending "all off" every ~2 s instead of stopping the
+        // timer. A WS2812 frame glitch used to leave one pixel lit until the next state change.
+        if (dark_ticks_ > 0) {
+            if (++dark_ticks_ >= 2000 / 50) {
+                dark_ticks_ = 1;
+                led_strip_clear(led_strip_);
+            }
+            return;
+        }
         bool all_off = true;
         for (int i = 0; i < max_leds_; i++) {
             colors_[i].red /= 2;
@@ -110,7 +120,7 @@ void CircularStrip::FadeOut(int interval_ms) {
         }
         if (all_off) {
             led_strip_clear(led_strip_);
-            esp_timer_stop(strip_timer_);
+            dark_ticks_ = 1;
         } else {
             led_strip_refresh(led_strip_);
         }
@@ -134,8 +144,10 @@ void CircularStrip::Breathe(StripColor low, StripColor high, int interval_ms) {
             if (breathe_color_.red == low.red && breathe_color_.green == low.green && breathe_color_.blue == low.blue)
                 breathe_up_ = true;
         }
-        for (int i = 0; i < max_leds_; i++)
+        for (int i = 0; i < max_leds_; i++) {
+            colors_[i] = breathe_color_;
             led_strip_set_pixel(led_strip_, i, breathe_color_.red, breathe_color_.green, breathe_color_.blue);
+        }
         led_strip_refresh(led_strip_);
     });
 }
@@ -204,25 +216,95 @@ void CircularStrip::SetThinking(bool thinking) {
     OnStateChanged();
 }
 
+bool CircularStrip::ErrorActive() const {
+    return esp_timer_get_time() < error_until_us_.load();
+}
+
+void CircularStrip::ShowError() {
+    error_until_us_ = esp_timer_get_time() + 5 * 1000 * 1000;  // red for 5 s
+    OnStateChanged();
+}
+
+// Skipper: show a solid color until until_us, then fade out and stay dark.
+void CircularStrip::HoldThenDark(StripColor color, int64_t until_us) {
+    hold_ticks_ = 0;
+    dark_ticks_ = 0;
+    StartStripTask(50, [this, color, until_us]() {
+        if (esp_timer_get_time() < until_us) {
+            if (hold_ticks_++ % 20 == 0) {  // (re)send every second
+                for (int i = 0; i < max_leds_; i++) {
+                    colors_[i] = color;
+                    led_strip_set_pixel(led_strip_, i, color.red, color.green, color.blue);
+                }
+                led_strip_refresh(led_strip_);
+            }
+            return;
+        }
+        if (dark_ticks_ > 0) {
+            if (++dark_ticks_ >= 2000 / 50) {
+                dark_ticks_ = 1;
+                led_strip_clear(led_strip_);
+            }
+            return;
+        }
+        bool all_off = true;
+        for (int i = 0; i < max_leds_; i++) {
+            colors_[i].red /= 2;
+            colors_[i].green /= 2;
+            colors_[i].blue /= 2;
+            if (colors_[i].red || colors_[i].green || colors_[i].blue) all_off = false;
+            led_strip_set_pixel(led_strip_, i, colors_[i].red, colors_[i].green, colors_[i].blue);
+        }
+        if (all_off) {
+            led_strip_clear(led_strip_);
+            dark_ticks_ = 1;
+        } else {
+            led_strip_refresh(led_strip_);
+        }
+    });
+}
+
+static const StripColor kSkipperRed   = { 24, 0, 0 };
+static const StripColor kSkipperGreen = { 0, 20, 0 };
+static const StripColor kSkipperAmber = { 14, 6, 0 };
+
 void CircularStrip::OnStateChanged() {
     auto& app = Application::GetInstance();
     auto device_state = app.GetDeviceState();
     switch (device_state) {
         case kDeviceStateStarting: {
+            if (ErrorActive()) {
+                // Skipper: boot problem (e.g. can't reach the server) = red
+                SetAllColor(kSkipperRed);
+                break;
+            }
+            // Skipper: dim amber chase while booting / joining Wi-Fi
             StripColor low = { 0, 0, 0 };
-            StripColor high = { low_brightness_, low_brightness_, default_brightness_ };
-            Scroll(low, high, 3, 100);
+            Scroll(low, kSkipperAmber, 3, 120);
             break;
         }
         case kDeviceStateWifiConfiguring: {
-            StripColor color = { low_brightness_, low_brightness_, default_brightness_ };
-            Blink(color, 500);
+            // Skipper: Wi-Fi needs setting up = slow red blink
+            Blink(kSkipperRed, 700);
             break;
         }
-        case kDeviceStateIdle:
+        case kDeviceStateIdle: {
             thinking_ = false;
-            FadeOut(50);
+            int64_t now = esp_timer_get_time();
+            if (ErrorActive()) {
+                HoldThenDark(kSkipperRed, error_until_us_.load());
+            } else if (!ready_shown_ || now < ready_until_us_) {
+                // Skipper: first idle after boot = green for 3 s, then off
+                if (!ready_shown_) {
+                    ready_shown_ = true;
+                    ready_until_us_ = now + 3 * 1000 * 1000;
+                }
+                HoldThenDark(kSkipperGreen, ready_until_us_);
+            } else {
+                FadeOut(50);
+            }
             break;
+        }
         case kDeviceStateConnecting: {
             // Skipper: dim warm glow while the connection opens
             StripColor color = { 8, 6, 4 };
@@ -259,6 +341,9 @@ void CircularStrip::OnStateChanged() {
             Blink(color, 500);
             break;
         }
+        case kDeviceStateFatalError:
+            SetAllColor(kSkipperRed);
+            break;
         default:
             ESP_LOGW(TAG, "Unknown led strip event: %d", device_state);
             return;
