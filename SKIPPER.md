@@ -1,8 +1,10 @@
 # Skipper Pod firmware notes
 
 Target: Waveshare ESP32-S3-AUDIO-Board (8 MB PSRAM, 16 MB flash), ESP-IDF 6.0.3.
-Known-good configs live one level up: `../sdkconfig.hiesp-cloud.bak` (WakeNet "Hi ESP")
-and `../sdkconfig.mww.bak` (microWakeWord "Hey Skipper", current).
+Build config: `sdkconfig.skipper-pod` in this repo (microWakeWord "Hey Skipper", the config of the
+current device build). Copy it to `sdkconfig` before `idf.py build` (the skipper-ai wrapper
+`hardware/skipper-pod/scripts/build.sh` does this). This tree lives in skipper-ai as the submodule
+`hardware/skipper-pod/firmware`, so `../wakeword` below is `hardware/skipper-pod/wakeword`.
 
 ## "Hey Skipper" wake word (microWakeWord on TFLite Micro)
 
