@@ -85,3 +85,23 @@ Result for the release-v7 model (20 holdout positives, 1.2 s silence lead-in): 0
 pymicro-features over 217 000 values, 20/20 detected with the firmware's exact int8 features
 and ESPHome streaming logic. The int8 features differ from the model's own input quantization
 by at most 1 LSB on about 25% of values, which is the expected effect of ESPHome's /666 mapping.
+
+## LED ring (`main/led/circular_strip.cc`)
+
+The board has 7 WS2812s on GPIO38 (U19 then U9..U14); the board file drives all 7. (Upstream
+drove 6, which left the last LED unmanaged: after a frame glitch it could latch on and stay lit.)
+While idle the ring re-sends "all off" every 2 s, so a corrupted frame heals itself.
+
+| State | Ring |
+|---|---|
+| Booting | dim amber chase |
+| Wi-Fi setup needed | slow red blink |
+| Error alert (`Alert` with status ERROR) | red for 5 s, then off |
+| Ready (first idle after boot) | green for 3 s, then off |
+| Idle | off |
+| Listening | warm white |
+| Thinking | warm white swirl |
+| Speaking | slow warm breathe |
+
+The small green LED next to the battery header (LED1) is the ETA6098 charger's status light.
+It is hardwired to the charger, so firmware can't control it.
