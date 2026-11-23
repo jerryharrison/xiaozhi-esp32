@@ -142,7 +142,7 @@ private:
 
     // Stats.
     int64_t stat_t0_ = 0;
-    int stat_frames_ = 0, stat_rows_ = 0, stat_full_ = 0;
+    int stat_frames_ = 0, stat_rows_ = 0, stat_full_ = 0, stat_touch_errors_ = 0;
     int64_t stat_render_us_ = 0, stat_flush_us_ = 0, stat_max_us_ = 0, stat_helper_wait_us_ = 0;
 
     static bool OnTransDone(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t* edata, void* ctx);

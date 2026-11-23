@@ -429,8 +429,9 @@ void AvatarDisplay::PollTouch(int64_t now_us) {
     esp_lcd_touch_point_data_t pt = {};
     uint8_t cnt = 0;
     if (esp_lcd_touch_read_data(touch_) != ESP_OK) {
-        if (!touch_error_logged_) ESP_LOGW(TAG, "touch read failed");
+        if (!touch_error_logged_) ESP_LOGW(TAG, "touch read failed (counted in the fps line from now on)");
         touch_error_logged_ = true;
+        stat_touch_errors_++;
         return;
     }
     esp_lcd_touch_get_data(touch_, &pt, &cnt, 1);
@@ -492,6 +493,7 @@ void AvatarDisplay::PollTouch(int64_t now_us) {
     } else if (touching_) {
         touching_ = false;
         if (!gesture_moved_ && !gesture_long_ && now_us - touch_t0_ < 500000) {
+            ESP_LOGI(TAG, "tap at %d,%d", (int)touch_x0_, (int)touch_y0_);
             std::lock_guard<std::mutex> lk(in_mutex_);
             taps_++;
         }
@@ -673,17 +675,17 @@ void AvatarDisplay::RenderLoop() {
         if (frame_end - stat_t0_ >= 5000000) {
             float secs = (frame_end - stat_t0_) / 1e6f;
             float avg_ms = (stat_render_us_ + stat_flush_us_) / 1000.0f / std::max(1, stat_frames_);
-            ESP_LOGI(TAG, "%.1f fps, render %.1f ms + flush wait %.1f ms per frame (helper wait %.1f ms, max frame %.1f ms), %d rows/frame, %d full, scale %d, state %s",
+            ESP_LOGI(TAG, "%.1f fps, render %.1f ms + flush wait %.1f ms per frame (helper wait %.1f ms, max frame %.1f ms), %d rows/frame, %d full, scale %d, state %s, touch errors %d",
                      stat_frames_ / secs, stat_render_us_ / 1000.0f / std::max(1, stat_frames_),
                      stat_flush_us_ / 1000.0f / std::max(1, stat_frames_),
                      stat_helper_wait_us_ / 1000.0f / std::max(1, stat_frames_), stat_max_us_ / 1000.0f,
-                     stat_rows_ / std::max(1, stat_frames_), stat_full_, scale_, avatar_state_name(&av_));
+                     stat_rows_ / std::max(1, stat_frames_), stat_full_, scale_, avatar_state_name(&av_), stat_touch_errors_);
             if (auto_scale_ && scale_ == 1 && avg_ms > 55) {
                 ESP_LOGW(TAG, "full-resolution frames average %.1f ms: switching to half resolution", avg_ms);
                 SetScale(2);
             }
             stat_t0_ = frame_end;
-            stat_frames_ = stat_rows_ = stat_full_ = 0;
+            stat_frames_ = stat_rows_ = stat_full_ = stat_touch_errors_ = 0;
             stat_render_us_ = stat_flush_us_ = stat_max_us_ = stat_helper_wait_us_ = 0;
         }
 

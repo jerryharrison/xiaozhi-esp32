@@ -23,3 +23,4 @@ mmap_generate_*.h
 
 # Skipper Porthole build (main/boards/porthole/build.sh)
 build-porthole/
+release/
