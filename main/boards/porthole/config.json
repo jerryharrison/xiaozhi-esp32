@@ -1,0 +1,19 @@
+{
+    "manufacturer": "skipper",
+    "type": "porthole",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "porthole",
+            "sdkconfig_append": [
+                "CONFIG_BOARD_TYPE_SKIPPER_PORTHOLE=y",
+                "CONFIG_USE_WECHAT_MESSAGE_STYLE=n",
+                "CONFIG_USE_DEVICE_AEC=y",
+                "CONFIG_USE_MICRO_WAKE_WORD=y",
+                "CONFIG_WAKE_WORD_DETECTION_IN_LISTENING=y",
+                "CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v2/32m.csv\""
+            ]
+        }
+    ]
+}

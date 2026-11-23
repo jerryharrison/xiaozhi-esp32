@@ -461,6 +461,11 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_1_75C)
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_30_4)
     set(BUILTIN_ICON_FONT font_material_symbols_30_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
+elseif(CONFIG_BOARD_TYPE_SKIPPER_PORTHOLE)
+    # Skipper: avatar UI (no LVGL screens, so no emoji collection). See boards/porthole/README.md.
+    set(BOARD_DIR "porthole")
+    set(BUILTIN_TEXT_FONT font_noto_sans_basic_30_4)
+    set(BUILTIN_ICON_FONT font_material_symbols_30_4)
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_83)
     set(BOARD_DIR "waveshare/esp32-s3-touch-lcd-1.83")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_16_4)
@@ -1175,6 +1180,12 @@ if(CONFIG_IDF_TARGET_ESP32S3)
 endif()
 
 set(MAIN_PRIV_REQUIRES_EXTRA "")
+# Skipper: hardware/avatar-render from skipper-ai (found by the top-level CMakeLists.txt), used by
+# boards/porthole. Kconfig values are not visible while requirements are expanded, so this can't be
+# keyed on the board: other boards compile the component but link none of it (it is not WHOLE_ARCHIVE).
+if(DEFINED ENV{AVATAR_RENDER_DIR} OR EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../../avatar-render/CMakeLists.txt")
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA avatar-render)
+endif()
 if(CONFIG_XIAOZHI_NETWORK_ETHERNET AND CONFIG_XIAOZHI_ETH_PHY_IP101)
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA espressif__ip101)
 endif()
