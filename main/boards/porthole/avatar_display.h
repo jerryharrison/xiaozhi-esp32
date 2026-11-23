@@ -79,7 +79,8 @@ private:
     struct RenderJob { uint16_t* fb; int stride, y0, y1; };
     RenderJob job_ = {};
 
-    avatar_t av_;
+    // Read by every pixel: keep it in internal RAM (the display object itself may land in PSRAM).
+    avatar_t& av_;
 
     // Inputs from other tasks, guarded by in_mutex_.
     std::mutex in_mutex_;
@@ -142,7 +143,7 @@ private:
     // Stats.
     int64_t stat_t0_ = 0;
     int stat_frames_ = 0, stat_rows_ = 0, stat_full_ = 0;
-    int64_t stat_render_us_ = 0, stat_flush_us_ = 0, stat_max_us_ = 0;
+    int64_t stat_render_us_ = 0, stat_flush_us_ = 0, stat_max_us_ = 0, stat_helper_wait_us_ = 0;
 
     static bool OnTransDone(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t* edata, void* ctx);
     static void TaskEntry(void* arg);

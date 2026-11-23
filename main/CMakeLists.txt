@@ -1183,8 +1183,10 @@ set(MAIN_PRIV_REQUIRES_EXTRA "")
 # Skipper: hardware/avatar-render from skipper-ai (found by the top-level CMakeLists.txt), used by
 # boards/porthole. Kconfig values are not visible while requirements are expanded, so this can't be
 # keyed on the board: other boards compile the component but link none of it (it is not WHOLE_ARCHIVE).
+set(MAIN_LDFRAGMENTS "")
 if(DEFINED ENV{AVATAR_RENDER_DIR} OR EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../../avatar-render/CMakeLists.txt")
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA avatar-render)
+    list(APPEND MAIN_LDFRAGMENTS "boards/porthole/avatar.lf")   # IRAM placement, porthole only
 endif()
 if(CONFIG_XIAOZHI_NETWORK_ETHERNET AND CONFIG_XIAOZHI_ETH_PHY_IP101)
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA espressif__ip101)
@@ -1245,6 +1247,7 @@ endif()
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS} ${MWW_EMBED_FILES}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
+                    LDFRAGMENTS ${MAIN_LDFRAGMENTS}
                     WHOLE_ARCHIVE
                     PRIV_REQUIRES
                         esp_pm

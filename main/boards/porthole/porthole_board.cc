@@ -134,7 +134,10 @@ private:
             GetBacklight()->RestoreBrightness();
         });
         power_save_timer_->OnShutdownRequest([this]() { pmic_->PowerOff(); });
-        power_save_timer_->SetEnabled(true);
+        // Only on battery: GetBatteryLevel() enables it when the AXP2101 reports discharging.
+        // (Enabled from boot, as upstream does, it powered the board off after 5 idle minutes
+        // even on USB, because the enable only flips when the discharging state changes.)
+        power_save_timer_->SetEnabled(false);
     }
 
     void InitializeI2c() {

@@ -70,7 +70,9 @@ bool IsSpecState(const char* e) {
 }  // namespace
 
 AvatarDisplay::AvatarDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel, int width, int height)
-    : panel_io_(panel_io), panel_(panel) {
+    : panel_io_(panel_io), panel_(panel),
+      av_(*static_cast<avatar_t*>(heap_caps_malloc(sizeof(avatar_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT))) {
+    assert(&av_ != nullptr);
     width_ = width;
     height_ = height;
     lock_ = xSemaphoreCreateRecursiveMutex();
@@ -92,6 +94,7 @@ AvatarDisplay::~AvatarDisplay() {
     if (task_) vTaskDelete(task_);
     for (auto b : buf_) heap_caps_free(b);
     if (half_buf_) heap_caps_free(half_buf_);
+    heap_caps_free(&av_);
 }
 
 bool AvatarDisplay::OnTransDone(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t*, void* ctx) {
@@ -138,7 +141,9 @@ void AvatarDisplay::RenderSplit(uint16_t* fb, int stride, int y0, int y1) {
     job_ = {fb + (mid - y0) * stride, stride, mid, y1};
     xTaskNotifyGive(helper_);
     avatar_render(&av_, fb, stride, y0, mid, AVATAR_RGB565_SWAP);
+    int64_t t = esp_timer_get_time();
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    stat_helper_wait_us_ += esp_timer_get_time() - t;
 }
 
 // ------------------------------------------------------------------ inputs from other tasks
@@ -668,9 +673,10 @@ void AvatarDisplay::RenderLoop() {
         if (frame_end - stat_t0_ >= 5000000) {
             float secs = (frame_end - stat_t0_) / 1e6f;
             float avg_ms = (stat_render_us_ + stat_flush_us_) / 1000.0f / std::max(1, stat_frames_);
-            ESP_LOGI(TAG, "%.1f fps, render %.1f ms + flush wait %.1f ms per frame (max frame %.1f ms), %d rows/frame, %d full, scale %d, state %s",
+            ESP_LOGI(TAG, "%.1f fps, render %.1f ms + flush wait %.1f ms per frame (helper wait %.1f ms, max frame %.1f ms), %d rows/frame, %d full, scale %d, state %s",
                      stat_frames_ / secs, stat_render_us_ / 1000.0f / std::max(1, stat_frames_),
-                     stat_flush_us_ / 1000.0f / std::max(1, stat_frames_), stat_max_us_ / 1000.0f,
+                     stat_flush_us_ / 1000.0f / std::max(1, stat_frames_),
+                     stat_helper_wait_us_ / 1000.0f / std::max(1, stat_frames_), stat_max_us_ / 1000.0f,
                      stat_rows_ / std::max(1, stat_frames_), stat_full_, scale_, avatar_state_name(&av_));
             if (auto_scale_ && scale_ == 1 && avg_ms > 55) {
                 ESP_LOGW(TAG, "full-resolution frames average %.1f ms: switching to half resolution", avg_ms);
@@ -678,7 +684,7 @@ void AvatarDisplay::RenderLoop() {
             }
             stat_t0_ = frame_end;
             stat_frames_ = stat_rows_ = stat_full_ = 0;
-            stat_render_us_ = stat_flush_us_ = stat_max_us_ = 0;
+            stat_render_us_ = stat_flush_us_ = stat_max_us_ = stat_helper_wait_us_ = 0;
         }
 
         int64_t wait_ms = (int64_t)period_ms - (esp_timer_get_time() - frame_start) / 1000;

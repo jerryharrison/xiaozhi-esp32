@@ -1,0 +1,7 @@
+# Skipper Porthole: run the avatar renderer from IRAM. Its per-pixel loop shares the flash cache
+# with Wi-Fi, audio and wake word otherwise.
+[mapping:porthole_avatar_render]
+archive: libavatar-render.a
+entries:
+    if BOARD_TYPE_SKIPPER_PORTHOLE = y:
+        * (noflash)
