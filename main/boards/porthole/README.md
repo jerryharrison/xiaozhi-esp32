@@ -16,6 +16,9 @@ Config: `sdkconfig.porthole` (a defaults fragment on top of `sdkconfig.defaults`
 `config.json`). The avatar renderer is `hardware/avatar-render` in skipper-ai (this repo is the
 submodule `hardware/skipper-pod/firmware`). Set `AVATAR_RENDER_DIR` to build against another
 checkout; after changing it, run `idf.py -B build-porthole reconfigure` (CMake caches the path).
+If Homebrew's `python3` is newer than the Python ESP-IDF was installed with (no
+`~/.espressif/python_env/idf6.0_pyX.Y_env` for it), `build.sh` puts a shim for an installed
+version (3.12 on the Mac Studio) first on PATH, so plain `export.sh` users need `PATH=<dir with python3 -> python3.12>:$PATH`.
 
 First flash: `merged-binary.bin` at 0x0. Updates without losing Wi-Fi (NVS at 0x9000 is left alone):
 

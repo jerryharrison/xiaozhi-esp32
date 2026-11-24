@@ -5,6 +5,23 @@
 set -euo pipefail
 FW="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$FW"
+# ESP-IDF's export.sh uses the first python3 on PATH and wants a venv built for that exact version
+# (~/.espressif/python_env/idf6.0_pyX.Y_env). If Homebrew moves python3 ahead (e.g. to 3.15), put a
+# python3/python shim for a version that has a venv first on PATH instead of reinstalling IDF.
+idf_python_shim() {
+  local tools="${IDF_TOOLS_PATH:-$HOME/.espressif}" p v shim
+  for p in python3 python3.12 python3.13 python3.11 python3.10; do
+    command -v "$p" >/dev/null 2>&1 || continue
+    v=$("$p" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null) || continue
+    compgen -G "$tools/python_env/idf*_py${v}_env" >/dev/null || continue
+    [ "$p" = python3 ] && return 0
+    shim="$(mktemp -d "${TMPDIR:-/tmp}/idf-python.XXXXXX")"
+    ln -s "$(command -v "$p")" "$shim/python3"; ln -s "$(command -v "$p")" "$shim/python"
+    export PATH="$shim:$PATH"
+    return 0
+  done
+}
+idf_python_shim
 if [ -z "${IDF_PATH:-}" ] || ! command -v idf.py >/dev/null 2>&1; then
   . "${IDF_PATH:-$HOME/esp/esp-idf-v6.0.3}/export.sh" >/dev/null
 fi
