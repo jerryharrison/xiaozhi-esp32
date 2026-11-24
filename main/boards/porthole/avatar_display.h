@@ -6,13 +6,16 @@
 #include "display.h"
 #include "device_state.h"
 #include "avatar.h"
+#include "avatar_dirty.h"
 
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_touch.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <freertos/queue.h>
 
 #include <atomic>
 #include <functional>
@@ -58,6 +61,7 @@ protected:
 
 private:
     static constexpr int kBandRows = 16;     // rows per DMA band (must be even for the CO5300)
+    static constexpr int kBuffers = 3;       // DMA band buffers: rendering runs ahead of the QSPI transfers
 
     static constexpr int kMaxTextItems = 8;
     struct TextItem {
@@ -72,15 +76,26 @@ private:
     esp_lcd_touch_handle_t touch_ = nullptr;
     SemaphoreHandle_t lock_ = nullptr;        // recursive: panel access (render loop, backlight)
     SemaphoreHandle_t buf_free_ = nullptr;    // counts DMA buffers not in flight
-    uint16_t* buf_[2] = {nullptr, nullptr};
+    uint16_t* buf_[kBuffers] = {};
     int buf_next_ = 0;
     TaskHandle_t task_ = nullptr;
-    TaskHandle_t helper_ = nullptr;   // second core: renders the lower half of each band
-    struct RenderJob { uint16_t* fb; int stride, y0, y1; };
+    TaskHandle_t helper_ = nullptr;   // second core: renders the odd rows of each band
+    SemaphoreHandle_t pace_ = nullptr;          // frame pacing: given by pace_timer_
+    esp_timer_handle_t pace_timer_ = nullptr;   // (vTaskDelay is 10 ms coarse at 100 Hz)
+    struct RenderJob { uint16_t* fb; int stride, y0, y1, x0, x1; };
     RenderJob job_ = {};
+    std::atomic<int> next_row_{0};    // both cores take the band's rows from here
+    void RenderShared();
+    // Finished bands go to a small flush task: esp_lcd's draw call waits for the previous band's DMA
+    // (and sends the window commands by polling), which would otherwise stall a rendering core.
+    struct FlushJob { uint16_t* buf; int x0, y0, x1, y1; };
+    QueueHandle_t flush_q_ = nullptr;
+    TaskHandle_t flusher_ = nullptr;
+    static void FlusherEntry(void* arg);
 
     // Read by every pixel: keep it in internal RAM (the display object itself may land in PSRAM).
     avatar_t& av_;
+    avatar_frame_t& frame_;            // avatar_prepare'd once per frame, read by both cores
 
     // Inputs from other tasks, guarded by in_mutex_.
     std::mutex in_mutex_;
@@ -113,12 +128,15 @@ private:
     std::string requested_state_;
     uint32_t level_tail_ = 0;
     int dirty_prev_[2] = {0, 0};   // previous frame's active row span
+    avatar_dirty_t shape_ = {}, shape_prev_ = {};   // where this / the last frame could change
+    float prev_sweep_ = -1;        // previous frame's timer sweep angle, -1 = no timer
     uint32_t static_sig_ = 0;
     uint32_t overlay_sig_ = 0;
     TextItem text_[kMaxTextItems];
     int text_count_ = 0;
     bool volume_arc_ = false;
     int volume_shown_ = 0;
+    int volume_sig_ = -1;           // volume level last drawn (-1: no volume arc)
     bool low_battery_ = false;
     int scale_ = 1;                 // 1 = full resolution, 2 = half resolution, pixel-doubled
     bool auto_scale_ = true;
@@ -143,21 +161,24 @@ private:
     // Stats.
     int64_t stat_t0_ = 0;
     int stat_frames_ = 0, stat_rows_ = 0, stat_full_ = 0, stat_touch_errors_ = 0;
+    int64_t stat_px_ = 0;
     int64_t stat_render_us_ = 0, stat_flush_us_ = 0, stat_max_us_ = 0, stat_helper_wait_us_ = 0;
 
     static bool OnTransDone(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t* edata, void* ctx);
     static void TaskEntry(void* arg);
     static void HelperEntry(void* arg);
-    void RenderSplit(uint16_t* fb, int stride, int y0, int y1);
+    void RenderSplit(uint16_t* fb, int stride, int y0, int y1, int x0, int x1);
     void RenderLoop();
     void PollTouch(int64_t now_us);
     void ApplyInputs(int64_t now_us, float* frame_period_ms);
     float PlaybackLevel(int64_t now_us);
     void ActiveRows(int* y0, int* y1);
-    void RenderRows(int y0, int y1);
+    void RenderRows(int y0, int y1, bool clip);   // clip: only the columns avatar_band_cols allows
+    bool OverlayInRows(int y0, int y1);
     void DrawOverlays(uint16_t* band, int y0, int y1);
     void DrawText(uint16_t* band, int y0, int y1, const std::string& text, int y_top, bool big, const float rgb[3]);
     void DrawVolumeArc(uint16_t* band, int y0, int y1);
+    void RimArcRows(float a, float b, int* y0, int* y1);
     void BuildText(int64_t now_us);
     int AddWrapped(const std::string& text, int y, int max_width, int max_lines, bool amber);
     void SetScale(int scale);
