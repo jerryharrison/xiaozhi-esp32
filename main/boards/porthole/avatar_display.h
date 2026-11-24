@@ -187,7 +187,13 @@ private:
     int64_t stat_t0_ = 0;
     int stat_frames_ = 0, stat_rows_ = 0, stat_full_ = 0, stat_touch_errors_ = 0;
     int64_t stat_px_ = 0;
-    int64_t stat_render_us_ = 0, stat_flush_us_ = 0, stat_max_us_ = 0, stat_helper_wait_us_ = 0;
+    int64_t stat_render_us_ = 0, stat_flush_us_ = 0, stat_max_us_ = 0, stat_helper_wait_us_ = 0, stat_overlay_us_ = 0;
+
+    // Resolution fallback: full resolution drops to half when 5 s of frames average over the budget, and
+    // comes back after recover_need_s_ cheap seconds (3, doubling up to 60 if it trips again within 30 s).
+    static constexpr float kFullResBudgetMs = 55;
+    int64_t recover_t0_ = 0, recover_us_ = 0, scale_up_us_ = -60000000;
+    int recover_frames_ = 0, recover_ok_s_ = 0, recover_need_s_ = 3;
 
     static bool OnTransDone(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t* edata, void* ctx);
     static void TaskEntry(void* arg);
@@ -206,7 +212,6 @@ private:
                   const float rgb[3]);
     void DrawCards(uint16_t* band, int stride, int x0, int x1, int y0, int y1);
     void UpdateCards(int64_t now_us, bool idle, std::string* want);
-    void RimArcRows(float a, float b, int* y0, int* y1);
     void BuildText(int64_t now_us);
     int AddWrapped(const std::string& text, int y, int max_width, int max_lines, bool amber);
     void SetScale(int scale);

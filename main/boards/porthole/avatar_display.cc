@@ -126,7 +126,11 @@ void AvatarDisplay::Start(esp_lcd_touch_handle_t touch) {
     xTaskCreatePinnedToCore(FlusherEntry, "avatar_flush", 3072, this, 9, &flusher_, 0);
     xTaskCreatePinnedToCore(TaskEntry, "avatar", 6144, this, 1, &task_, 0);
     if (xTaskCreatePinnedToCore(HelperEntry, "avatar2", 4096, this, 1, &helper_, 1) != pdPASS) helper_ = nullptr;
-    xTaskCreate(CardClientEntry, "cards", 8192, this, 2, &card_task_);
+    // The card client's HTTPS poll spends 1.5-2 s of CPU in the TLS handshake. Above the render tasks
+    // (it was priority 2) that took a whole core and stalled a frame for as long; at idle priority it
+    // only runs while both render cores wait for the next frame. It shares no lock with rendering:
+    // the reply goes over in card_poll_ under in_mutex_, which the render task holds only briefly.
+    xTaskCreate(CardClientEntry, "cards", 8192, this, tskIDLE_PRIORITY, &card_task_);
 }
 
 void AvatarDisplay::TaskEntry(void* arg) { static_cast<AvatarDisplay*>(arg)->RenderLoop(); }
@@ -655,8 +659,10 @@ void AvatarDisplay::RenderRows(int y0, int y1, bool clip, int cx0, int cx1) {
                     for (int x = 0; x < hw; x++) dst[2 * x] = dst[2 * x + 1] = src[x];
                 }
             }
+            int64_t to = esp_timer_get_time();
             DrawOverlays(buf, w, x0, x1, y, yb1);
             int64_t t2 = esp_timer_get_time();
+            stat_overlay_us_ += t2 - to;
             FlushJob job = {buf, x0, y, x1, yb1};
             xQueueSend(flush_q_, &job, portMAX_DELAY);
             stat_flush_us_ += t1 - t0;
@@ -694,9 +700,6 @@ void AvatarDisplay::DrawCards(uint16_t* band, int stride, int x0, int x1, int y0
     porthole_draw_cards(card_layer_, &av_, scale_, width_, band, stride, x0, x1, y0, y1);   // avatar_card_draw.h
 }
 
-void AvatarDisplay::RimArcRows(float a, float b, int* y0, int* y1) {
-    porthole_rim_arc_rows(width_, height_, a, b, y0, y1);
-}
 
 void AvatarDisplay::DrawOverlays(uint16_t* band, int stride, int x0, int x1, int y0, int y1) {
     DrawCards(band, stride, x0, x1, y0, y1);
@@ -763,6 +766,15 @@ void AvatarDisplay::RenderLoop() {
             s1 = std::min(height_, (std::min(s1, height_) + kBandRows - 1) / kBandRows * kBandRows);
             if (s1 > s0 && nspans < 4) spans[nspans++] = {s0, s1};
         };
+        struct Rect { int x0, y0, x1, y1; } rects[4];
+        int nrects = 0;
+        auto add_rect = [&](int x0, int y0, int x1, int y1) {   // even-aligned for the CO5300
+            x0 = std::max(0, x0) & ~1;
+            y0 = std::max(0, y0) & ~1;
+            x1 = std::min(width_, (x1 + 1) & ~1);
+            y1 = std::min(height_, (y1 + 1) & ~1);
+            if (x1 > x0 && y1 > y0 && nrects < 4) rects[nrects++] = {x0, y0, x1, y1};
+        };
         int act0 = 0, act1 = 0;   // the active rows: rendered with column clipping
         if (full) {
             act1 = height_;
@@ -788,17 +800,22 @@ void AvatarDisplay::RenderLoop() {
                 card_rect_[2] = std::min(width_, (b[2] + 1) & ~1);
                 card_rect_[3] = std::min(height_, (b[3] + 1) & ~1);
             }
+            // A rim arc's end moved (a card's progress, the volume level): only the rim's box between the
+            // old and new end can change (porthole_rim_arc_box), not whole rows.
             if (carc != card_arc_drawn_) {
-                int s0, s1;
-                RimArcRows(2 * kPi * std::max(0.0f, carc), 2 * kPi * std::max(0.0f, card_arc_drawn_), &s0, &s1);
-                add_span(s0, s1);
+                int b[4];
+                porthole_rim_arc_box(width_, height_, 2 * kPi * std::max(0.0f, carc), 2 * kPi * std::max(0.0f, card_arc_drawn_), b);
+                add_rect(b[0], b[1], b[2], b[3]);
             }
-            // A new volume level: the rim between the old and new level, and the number.
+            // A new volume level: the rim between the old and new level, and the number's box.
             if (vsig >= 0 && volume_sig_ >= 0 && vsig != volume_sig_) {
-                int s0, s1;
-                RimArcRows(2 * kPi * volume_sig_ / 100.0f, 2 * kPi * vsig / 100.0f, &s0, &s1);
-                add_span(s0, s1);
-                if (vol_text >= 0) add_span(text_[vol_text].y, text_[vol_text].y + pf_big.line_h);
+                int b[4];
+                porthole_rim_arc_box(width_, height_, 2 * kPi * volume_sig_ / 100.0f, 2 * kPi * vsig / 100.0f, b);
+                add_rect(b[0], b[1], b[2], b[3]);
+                if (vol_text >= 0) {
+                    int tw = std::max(TextWidth(pf_big, std::to_string(volume_sig_)), TextWidth(pf_big, text_[vol_text].text));
+                    add_rect((width_ - tw) / 2 - 8, text_[vol_text].y, (width_ + tw) / 2 + 8, text_[vol_text].y + pf_big.line_h);
+                }
             }
         }
         prev_sweep_ = av_.timer_on ? frame_.sweep : -1;
@@ -819,7 +836,8 @@ void AvatarDisplay::RenderLoop() {
         card_arc_drawn_ = carc;
         if (cbox[2] > cbox[0]) std::copy(cbox, cbox + 4, card_box_);
         else card_box_[0] = card_box_[2] = 0;
-        for (int i = 0; i < merged; i++) RenderRows(spans[i].a, spans[i].b, false);   // rim sweeps: whole rows
+        for (int i = 0; i < merged; i++) RenderRows(spans[i].a, spans[i].b, false);   // timer sweeps: whole rows
+        for (int i = 0; i < nrects; i++) RenderRows(rects[i].y0, rects[i].y1, false, rects[i].x0, rects[i].x1);
         shape_prev_ = shape_;
         static_sig_ = sig;
         overlay_sig_ = osig;
@@ -835,21 +853,44 @@ void AvatarDisplay::RenderLoop() {
         if (frame_end - stat_t0_ >= 5000000) {
             float secs = (frame_end - stat_t0_) / 1e6f;
             float avg_ms = (stat_render_us_ + stat_flush_us_) / 1000.0f / std::max(1, stat_frames_);
-            ESP_LOGI(TAG, "%.1f fps, render %.1f ms + flush wait %.1f ms per frame (helper wait %.1f ms, max frame %.1f ms), %d rows/frame (%d kpx), %d full, scale %d, state %s, touch errors %d",
+            ESP_LOGI(TAG, "%.1f fps, render %.1f ms (overlays %.1f) + flush wait %.1f ms per frame (helper wait %.1f ms, max frame %.1f ms), %d rows/frame (%d kpx), %d full, scale %d, state %s, touch errors %d",
                      stat_frames_ / secs, stat_render_us_ / 1000.0f / std::max(1, stat_frames_),
+                     stat_overlay_us_ / 1000.0f / std::max(1, stat_frames_),
                      stat_flush_us_ / 1000.0f / std::max(1, stat_frames_),
                      stat_helper_wait_us_ / 1000.0f / std::max(1, stat_frames_), stat_max_us_ / 1000.0f,
                      stat_rows_ / std::max(1, stat_frames_), (int)(stat_px_ / 1000 / std::max(1, stat_frames_)), stat_full_, scale_,
                      avatar_state_name(&av_),
                      stat_touch_errors_);
-            if (auto_scale_ && scale_ == 1 && avg_ms > 55) {
+            if (auto_scale_ && scale_ == 1 && avg_ms > kFullResBudgetMs) {
                 ESP_LOGW(TAG, "full-resolution frames average %.1f ms: switching to half resolution", avg_ms);
+                // Tripping again soon after a recovery doubles how long frames must stay cheap before the next try.
+                recover_need_s_ = frame_end - scale_up_us_ < 30000000 ? std::min(recover_need_s_ * 2, 60) : 3;
+                recover_ok_s_ = 0;
                 SetScale(2);
             }
             stat_t0_ = frame_end;
             stat_frames_ = stat_rows_ = stat_full_ = stat_touch_errors_ = 0;
             stat_px_ = 0;
-            stat_render_us_ = stat_flush_us_ = stat_max_us_ = stat_helper_wait_us_ = 0;
+            stat_render_us_ = stat_flush_us_ = stat_max_us_ = stat_helper_wait_us_ = stat_overlay_us_ = 0;
+        }
+        // Back to full resolution once half-resolution frames have stayed cheap (under 40% of the budget,
+        // render + flush wait) for recover_need_s_ seconds in a row, judged one second at a time.
+        recover_frames_++;
+        recover_us_ += frame_us;
+        if (frame_end - recover_t0_ >= 1000000) {
+            float avg = recover_us_ / 1000.0f / std::max(1, recover_frames_);
+            if (auto_scale_ && scale_ == 2) {
+                recover_ok_s_ = avg < 0.4f * kFullResBudgetMs ? recover_ok_s_ + 1 : 0;
+                if (recover_ok_s_ >= recover_need_s_) {
+                    ESP_LOGI(TAG, "half-resolution frames average %.1f ms for %d s: back to full resolution", avg, recover_ok_s_);
+                    scale_up_us_ = frame_end;
+                    recover_ok_s_ = 0;
+                    SetScale(1);
+                }
+            }
+            recover_t0_ = frame_end;
+            recover_frames_ = 0;
+            recover_us_ = 0;
         }
 
         // Sleep until the next frame is due (at least 1 ms, so idle tasks and the watchdog run).

@@ -148,12 +148,10 @@ int main(int argc, char** argv) {
         if (r[2] > r[0] && r[3] > r[1]) { int sp[1][2] = {{r[0], r[2]}}; render_span(r[1], r[3], sp, 1); px0 += (long)(r[3] - r[1]) * (r[2] - r[0]); }
       }
       if (carc != arc_drawn) {
-        int s0, s1;
-        porthole_rim_arc_rows(W, W, 2 * PORTHOLE_PI * std::max(0.0f, carc), 2 * PORTHOLE_PI * std::max(0.0f, arc_drawn), &s0, &s1);
-        s0 = std::max(0, s0) / BAND * BAND; s1 = std::min(W, (s1 + BAND - 1) / BAND * BAND);
-        int sp[1][2] = {{0, W}};
-        render_span(s0, s1, sp, 1);
-        px0 += (long)(s1 - s0) * W;
+        int r[4];   // as the device: only the rim's box between the old and new progress
+        porthole_rim_arc_box(W, W, 2 * PORTHOLE_PI * std::max(0.0f, carc), 2 * PORTHOLE_PI * std::max(0.0f, arc_drawn), r);
+        int sp[1][2] = {{r[0], r[2]}};
+        if (r[2] > r[0] && r[3] > r[1]) { render_span(r[1], r[3], sp, 1); px0 += (long)(r[3] - r[1]) * (r[2] - r[0]); }
       }
     }
     double t1 = now_s();

@@ -71,11 +71,21 @@ static inline void porthole_rim_arc(uint16_t* band, int stride, int x0, int x1, 
     // Clockwise from 12 o'clock up to `sweep`, by cross products with the sweep's direction.
     const float wx = sinf(sweep), wy = -cosf(sweep);
     const int big = sweep > PORTHOLE_PI;
+    // Coverage is clamp(rim/2 - |d - rc| + 0.5): 1 for d in [solid_lo, solid_hi], 0 outside (out_lo, out_hi).
+    // Classify by d^2 (no sqrt) with a small margin; only pixels near the ring's two edges (about 2 px per
+    // ring crossing) take the exact sqrt path, so the output is the same as computing every pixel exactly.
+    const float e = 0.02f;
+    const float slo = rc - rim / 2 + 0.5f + e, shi = rc + rim / 2 - 0.5f - e, olo = rc - rim / 2 - 0.5f - e, ohi = rc + rim / 2 + 0.5f + e;
+    const float solid_lo2 = slo * slo, solid_hi2 = shi * shi, out_lo2 = olo > 0 ? olo * olo : 0, out_hi2 = ohi * ohi;
+    const uint16_t amber = ph_pack(kPhAmber);   // a fully covered lit pixel is exactly amber
+    uint16_t slate_in = 0, slate_out = 0;       // one-entry cache: the rim under the slate is mostly one colour
+    int slate_ok = 0;
     for (int y = y0; y < y1; y++) {
         float dy = y + 0.5f - R;
         if (fabsf(dy) >= ro) continue;
         float xo = ph_sqrt(ro * ro - dy * dy), xi = fabsf(dy) < ri ? ph_sqrt(ri * ri - dy * dy) : 0;
         uint16_t* row = band + (y - y0) * stride - x0;
+        const float dy2 = dy * dy;
         // The ring's columns in this row: two spans, or one across the centre where the row passes
         // above/below the inner edge.
         int spans[2][2] = {{(int)(R - xo), (int)(R - xi) + 1}, {(int)(R + xi), (int)(R + xo) + 1}};
@@ -84,17 +94,71 @@ static inline void porthole_rim_arc(uint16_t* band, int stride, int x0, int x1, 
         for (int s = 0; s < n; s++) {
             int xa = spans[s][0] < x0 ? x0 : spans[s][0], xb = spans[s][1] > x1 ? x1 : spans[s][1];
             for (int x = xa; x < xb; x++) {
-                float dx = x + 0.5f - R, d = ph_sqrt(dx * dx + dy * dy);
-                float cov = ph_clampf(rim / 2 - fabsf(d - rc) + 0.5f, 0.0f, 1.0f);
-                if (cov <= 0) continue;
+                float dx = x + 0.5f - R, d2 = dx * dx + dy2;
+                if (d2 <= out_lo2 || d2 >= out_hi2) continue;
+                float cov = 1;
+                if (d2 < solid_lo2 || d2 > solid_hi2) {
+                    float d = ph_sqrt(d2);
+                    cov = ph_clampf(rim / 2 - fabsf(d - rc) + 0.5f, 0.0f, 1.0f);
+                    if (cov <= 0) continue;
+                }
                 float cr = dx * wy - dy * wx;   // > 0: the sweep direction is clockwise of (dx, dy)
                 int lit = big ? !(dx < 0 && cr < 0) : (dx >= 0 && cr >= 0);
                 if (!PORTHOLE_ARC_LEGACY) lit = frac >= 1 ? 1 : frac <= 0 ? 0 : lit;
-                if (lit) ph_blend(&row[x], kPhAmber, cov);
-                else if (slate_rest) ph_blend(&row[x], kPhSlate, cov * 0.8f);
+                if (lit) {
+                    if (cov >= 1) row[x] = amber;
+                    else ph_blend(&row[x], kPhAmber, cov);
+                } else if (slate_rest) {
+                    if (cov >= 1) {
+                        if (!slate_ok || row[x] != slate_in) {
+                            slate_in = row[x];
+                            ph_blend(&row[x], kPhSlate, 0.8f);
+                            slate_out = row[x];
+                            slate_ok = 1;
+                        } else {
+                            row[x] = slate_out;
+                        }
+                    } else {
+                        ph_blend(&row[x], kPhSlate, cov * 0.8f);
+                    }
+                }
             }
         }
     }
+}
+
+// The panel rectangle (x0, y0, x1, y1; even-aligned, clamped) holding every rim pixel whose centre lies
+// between angles a and b (radians clockwise from 12 o'clock): what a change of the arc's end from a to b
+// can touch. The annular sector's box: its four corners plus any axis extreme inside the angle range.
+static inline void porthole_rim_arc_box(int width, int height, float a, float b, int box[4]) {
+    const float R = width / 2.0f, rim = width * PORTHOLE_RIM_FRAC, ri = R - rim - 1, ro = R + 0.5f;
+    const float lo = a < b ? a : b, hi = a < b ? b : a;
+    float xmin = 1e9f, xmax = -1e9f, ymin = 1e9f, ymax = -1e9f;
+    const float th[2] = {lo, hi}, rr[2] = {ri, ro};
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++) {
+            float x = R + rr[j] * sinf(th[i]), y = R - rr[j] * cosf(th[i]);
+            if (x < xmin) xmin = x;
+            if (x > xmax) xmax = x;
+            if (y < ymin) ymin = y;
+            if (y > ymax) ymax = y;
+        }
+    // Axis extremes (12, 3, 6, 9 o'clock, and 12 again at a full turn) inside [lo, hi]: the outer radius.
+    for (int k = 0; k <= 4; k++) {
+        float t = k * (PORTHOLE_PI / 2);
+        if (t < lo || t > hi) continue;
+        float x = R + ro * sinf(t), y = R - ro * cosf(t);
+        if (x < xmin) xmin = x;
+        if (x > xmax) xmax = x;
+        if (y < ymin) ymin = y;
+        if (y > ymax) ymax = y;
+    }
+    int bx0 = ((int)floorf(xmin) - 2) & ~1, by0 = ((int)floorf(ymin) - 2) & ~1;
+    int bx1 = ((int)ceilf(xmax) + 4) & ~1, by1 = ((int)ceilf(ymax) + 4) & ~1;
+    box[0] = bx0 < 0 ? 0 : bx0;
+    box[1] = by0 < 0 ? 0 : by0;
+    box[2] = bx1 > width ? width : bx1;
+    box[3] = by1 > height ? height : by1;
 }
 
 // The volume level (0..100) in the avatar's own language: the bone rim turns amber clockwise from
