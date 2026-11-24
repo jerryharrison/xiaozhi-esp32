@@ -175,9 +175,11 @@ public:
         for (auto& c : live_)
             if (c.kind == CardKind::Timer && c.has_ends && c.done_us == 0 && now_us >= c.ends_us) {
                 c.done_us = c.last_ring_us = now_us;
-                c.priority = std::max(c.priority, 2);
                 *ring = true;
                 Offer(c, now_us);   // over a call it waits
+                bool up = false;
+                for (auto& in : insts_) up |= in.card.id == c.id && in.phase != Phase::Sink;
+                if (!up) c.seen = false;   // blocked: surface when the screen is free
             }
         // finished timers ring every 3.2 s until cleared, showing or not
         for (auto& c : live_)
@@ -319,7 +321,8 @@ private:
         if (c.dwell >= 0) return c.dwell;
         return c.kind == CardKind::Glance ? 6 : c.kind == CardKind::Message ? 10 : 0;
     }
-    static int PriorityOf(const Card& c) { return c.priority >= 0 ? c.priority : DefaultPriority(c.kind); }
+    // A finished timer ranks at least 2 while it waits to be cleared; the sender's priority stays.
+    static int PriorityOf(const Card& c) { return std::max(c.priority >= 0 ? c.priority : DefaultPriority(c.kind), c.done_us ? 2 : 0); }
     std::string Event(const std::string& id, const char* e) { events_.push_back({id, e}); return e; }
 
     Card* Find(const std::string& id) {
