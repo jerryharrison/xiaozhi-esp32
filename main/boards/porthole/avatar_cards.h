@@ -35,6 +35,7 @@ struct Card {
     int64_t ends_us = 0, expires_us = 0;
     // runtime
     int64_t answered_us = 0, done_us = 0, play_us = 0, last_ring_us = 0;
+    bool seen = false;       // has surfaced at least once (else it waits for a free screen)
 };
 
 // One line of card text to draw this frame.
@@ -176,8 +177,11 @@ public:
                 c.done_us = c.last_ring_us = now_us;
                 c.priority = std::max(c.priority, 2);
                 *ring = true;
-                Show(c.id, now_us, 0);
+                Offer(c, now_us);   // over a call it waits
             }
+        // finished timers ring every 3.2 s until cleared, showing or not
+        for (auto& c : live_)
+            if (c.done_us && now_us - c.last_ring_us > 3200000) { c.last_ring_us = now_us; *ring = true; }
         Sync();
         for (auto& in : insts_) {
             if (in.phase == Phase::Rise && now_us >= in.t0 + Us(in.dur)) { in.phase = Phase::Hold; in.hold_at = now_us; }
@@ -188,11 +192,14 @@ public:
         insts_.erase(std::remove_if(insts_.begin(), insts_.end(), [&](const Inst& in) {
             return in.phase == Phase::Sink && now_us >= in.t0 + Us(in.dur);
         }), insts_.end());
+        if (Active() == nullptr) {   // the screen is free: the highest-ranked card still waiting surfaces
+            Card* w = nullptr;
+            for (auto& c : live_) if (!c.seen && (w == nullptr || PriorityOf(c) > PriorityOf(*w))) w = &c;
+            if (w) Show(w->id, now_us, 0);
+        }
         Inst* a = Active();
         if (a == nullptr || now_us < a->t0) return nullptr;
-        Card* c = Find(a->card.id);
-        if (c && c->done_us && now_us - c->last_ring_us > 3200000) { c->last_ring_us = now_us; *ring = true; }
-        return c;
+        return Find(a->card.id);
     }
 
     // Seconds left on a card's countdown (or a large number).
@@ -351,6 +358,7 @@ private:
             Sink(*cur, now_us, dir ? -dir : 0, dir ? kSwipeSink : kSink * 0.8f);
             start = now_us + Us(dir ? kSwipeGap : 0.3f);
         }
+        c->seen = true;
         Inst in;
         in.card = *c;
         in.t0 = start;
@@ -359,6 +367,10 @@ private:
         insts_.push_back(in);
         if (insts_.size() > 4) insts_.erase(insts_.begin());
     }
+    void Offer(Card& c, int64_t now_us) {
+        Inst* a = Active();
+        if (a == nullptr || PriorityOf(c) >= PriorityOf(a->card)) Show(c.id, now_us, 0);
+    }
     bool Apply(const cJSON* m, int64_t now_us, double sender_ms) {
         const cJSON* jid = cJSON_GetObjectItem(m, "id");
         if (!cJSON_IsString(jid) || jid->valuestring[0] == 0) return false;
@@ -366,32 +378,40 @@ private:
         if (cJSON_IsTrue(cJSON_GetObjectItem(m, "remove"))) { bool had = Find(id) != nullptr; Remove(id, now_us); return had; }
         Card n;
         Card* old = Find(id);
-        if (old) n = *old;
+        if (old) n = *old;   // an update merges: fields it leaves out keep their values
         n.id = id;
-        std::string kind = Str(m, "kind");
-        n.kind = kind == "message" ? CardKind::Message : kind == "call" ? CardKind::Call : kind == "timer" ? CardKind::Timer : CardKind::Glance;
-        n.nlines = 0;
-        const cJSON* lines = cJSON_GetObjectItem(m, "lines");
-        const cJSON* it;
-        if (cJSON_IsArray(lines)) cJSON_ArrayForEach(it, lines) if (cJSON_IsString(it) && n.nlines < 3) n.lines[n.nlines++] = CardUtf8ToFont(it->valuestring);
-        n.label = Str(m, "label");
-        n.hint = Str(m, "hint");
-        n.mood = cJSON_IsString(cJSON_GetObjectItem(m, "mood")) ? cJSON_GetObjectItem(m, "mood")->valuestring : "steady";
-        n.nset = 0;
-        const cJSON* set = cJSON_GetObjectItem(m, "set");
-        if (cJSON_IsObject(set)) cJSON_ArrayForEach(it, set) if (cJSON_IsNumber(it) && n.nset < 4 && strlen(it->string) < sizeof n.set[0].key) {
-            strcpy(n.set[n.nset].key, it->string);
-            n.set[n.nset++].value = (float)it->valuedouble;
+        auto has = [&](const char* k) { return cJSON_GetObjectItem(m, k) != nullptr; };
+        if (has("kind") || !old) {
+            std::string kind = Str(m, "kind");
+            n.kind = kind == "message" ? CardKind::Message : kind == "call" ? CardKind::Call : kind == "timer" ? CardKind::Timer : CardKind::Glance;
         }
-        n.dwell = (float)Num(m, "dwell", -1);
-        n.priority = (int)Num(m, "priority", -1);
-        n.drain = std::clamp((float)Num(m, "drain", 0.1), 0.0f, 0.1f);
+        const cJSON* it;
+        if (has("lines")) {
+            n.nlines = 0;
+            const cJSON* lines = cJSON_GetObjectItem(m, "lines");
+            if (cJSON_IsArray(lines)) cJSON_ArrayForEach(it, lines) if (cJSON_IsString(it) && n.nlines < 3) n.lines[n.nlines++] = CardUtf8ToFont(it->valuestring);
+        }
+        if (has("label")) n.label = Str(m, "label");
+        if (has("hint")) n.hint = Str(m, "hint");
+        if (has("mood")) n.mood = cJSON_IsString(cJSON_GetObjectItem(m, "mood")) ? cJSON_GetObjectItem(m, "mood")->valuestring : "steady";
+        const cJSON* set = cJSON_GetObjectItem(m, "set");
+        if (set) {
+            n.nset = 0;
+            if (cJSON_IsObject(set)) cJSON_ArrayForEach(it, set) if (cJSON_IsNumber(it) && n.nset < 4 && strlen(it->string) < sizeof n.set[0].key) {
+                strcpy(n.set[n.nset].key, it->string);
+                n.set[n.nset++].value = (float)it->valuedouble;
+            }
+        }
+        if (has("dwell")) n.dwell = (float)Num(m, "dwell", -1);
+        if (has("priority")) n.priority = (int)Num(m, "priority", -1);
+        if (has("drain")) n.drain = std::clamp((float)Num(m, "drain", 0.1), 0.0f, 0.1f);
         auto to_local = [&](double ms) -> int64_t {   // a unix-ms deadline as an esp_timer time
             double ref = sender_ms > 0 ? sender_ms : ms;   // without `now`, treat it as already due
             return now_us + (int64_t)((ms - ref) * 1000.0);
         };
         const cJSON* pr = cJSON_GetObjectItem(m, "progress");
-        n.has_value = n.has_ends = false;
+        const int64_t old_ends = n.has_ends ? n.ends_us : 0;
+        if (pr) n.has_value = n.has_ends = false;
         if (cJSON_IsObject(pr)) {
             if (cJSON_IsNumber(cJSON_GetObjectItem(pr, "ends_at"))) {
                 n.has_ends = true;
@@ -404,7 +424,8 @@ private:
             }
             n.done = Str(pr, "done");
         }
-        n.expires_us = cJSON_IsNumber(cJSON_GetObjectItem(m, "expires_at")) && sender_ms > 0 ? to_local(Num(m, "expires_at", 0)) : 0;
+        if (n.done_us && n.has_ends && llabs(n.ends_us - old_ends) > 1500000 && n.ends_us > now_us) n.done_us = n.last_ring_us = 0;   // restarted
+        if (has("expires_at")) n.expires_us = cJSON_IsNumber(cJSON_GetObjectItem(m, "expires_at")) && sender_ms > 0 ? to_local(Num(m, "expires_at", 0)) : 0;
         if (n.expires_us && n.expires_us <= now_us) { if (old) Remove(id, now_us); return old != nullptr; }
         if (old) {
             bool same = old->nlines == n.nlines && old->label == n.label && old->hint == n.hint && old->mood == n.mood &&
@@ -417,8 +438,7 @@ private:
         }
         if ((int)live_.size() >= kMaxCards) live_.erase(live_.begin());
         live_.push_back(n);
-        Inst* a = Active();
-        if (a == nullptr || PriorityOf(n) >= PriorityOf(a->card)) Show(id, now_us, 0);
+        Offer(live_.back(), now_us);
         return true;
     }
 };
