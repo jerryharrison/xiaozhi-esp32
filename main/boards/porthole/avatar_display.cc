@@ -3,8 +3,11 @@
 #include "porthole_font.h"
 #include "avatar_dirty.h"
 #include "avatar_overlay.h"
+#include "avatar_card_draw.h"
 
 #include "board.h"
+#include "settings.h"
+#include "system_info.h"
 #include "audio_codec.h"
 #include "assets/lang_config.h"
 
@@ -15,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cJSON.h>
 
 #define TAG "AvatarDisplay"
 
@@ -23,6 +27,7 @@ namespace {
 const float* const kBone = kPhBone;
 const float* const kAmber = kPhAmber;
 constexpr float kPi = PORTHOLE_PI;
+constexpr float kRimFrac = PORTHOLE_RIM_FRAC;   // spec.json geometry.rim
 constexpr float kTimerMoodSeconds = 10;   // bridge mood "timer": how long the tide takes to drain
 
 // Pixel helpers live in avatar_overlay.h (shared with the host checks).
@@ -121,6 +126,7 @@ void AvatarDisplay::Start(esp_lcd_touch_handle_t touch) {
     xTaskCreatePinnedToCore(FlusherEntry, "avatar_flush", 3072, this, 9, &flusher_, 0);
     xTaskCreatePinnedToCore(TaskEntry, "avatar", 6144, this, 1, &task_, 0);
     if (xTaskCreatePinnedToCore(HelperEntry, "avatar2", 4096, this, 1, &helper_, 1) != pdPASS) helper_ = nullptr;
+    xTaskCreate(CardClientEntry, "cards", 8192, this, 2, &card_task_);
 }
 
 void AvatarDisplay::TaskEntry(void* arg) { static_cast<AvatarDisplay*>(arg)->RenderLoop(); }
@@ -243,6 +249,11 @@ void AvatarDisplay::SetThinking(bool thinking) {
     thinking_ = thinking;
 }
 
+void AvatarDisplay::ShowCard(const std::string& json) {
+    std::lock_guard<std::mutex> lk(in_mutex_);
+    if (card_msgs_.size() < 16) card_msgs_.push_back(json);
+}
+
 void AvatarDisplay::ShowVolume(int volume) {
     current_volume_ = volume;
     std::lock_guard<std::mutex> lk(in_mutex_);
@@ -345,15 +356,38 @@ void AvatarDisplay::ApplyInputs(int64_t now_us, float* frame_period_ms) {
         }
         BuildText(now_us);
     }
-    for (int i = 0; i < taps; i++) avatar_tap(&av_);
-    if (want != requested_state_) {
-        // "timer" (leave soon): the tide drains over kTimerMoodSeconds with the amber rim sweep,
-        // then the renderer returns to steady by itself.
-        if (want == "timer") avatar_countdown(&av_, kTimerMoodSeconds);
-        else if (avatar_set_state(&av_, want.c_str()) != 0) avatar_set_state(&av_, "steady");
-        ESP_LOGI(TAG, "avatar state -> %s (device state %d)", want.c_str(), (int)ds);
-        requested_state_ = want;
+    {
+        std::vector<std::string> msgs;
+        std::string poll;
+        {
+            std::lock_guard<std::mutex> lk(in_mutex_);
+            msgs.swap(card_msgs_);
+            poll.swap(card_poll_);
+        }
+        for (const auto& m : msgs) {
+            cJSON* root = cJSON_Parse(m.c_str());
+            if (root) { if (cards_.ApplyMessage(root, now_us)) ESP_LOGI(TAG, "card pushed (%d live)", (int)cards_.LiveCount()); cJSON_Delete(root); }
+        }
+        if (!poll.empty()) {
+            cJSON* root = cJSON_Parse(poll.c_str());
+            if (root) { if (cards_.Reconcile(root, now_us)) ESP_LOGI(TAG, "cards polled (%d live)", (int)cards_.LiveCount()); cJSON_Delete(root); }
+        }
     }
+    // Cards set the mood only between conversations, and never over an error or setup screen.
+    UpdateCards(now_us, !ps && ds == kDeviceStateIdle && mood_.empty() && !thinking_ && want == "steady", &want);
+    for (int i = 0; i < taps; i++) avatar_tap(&av_);
+    std::string mood_key = card_mood_ ? "card:" + card_mood_id_ + ":" + want : want;
+    if (mood_key != requested_state_) {
+        // "timer" (leave soon) from the bridge: the tide drains over kTimerMoodSeconds with the amber
+        // rim sweep, then the renderer returns to steady by itself. A timer card drives the drain itself.
+        if (want == "timer" && !card_mood_) avatar_countdown(&av_, kTimerMoodSeconds);
+        else if (avatar_set_state(&av_, want.c_str()) != 0) avatar_set_state(&av_, "steady");
+        if (card_mood_)
+            for (const auto& p : card_params_) avatar_set_param(&av_, p.key, p.value);
+        ESP_LOGI(TAG, "avatar state -> %s (device state %d%s)", want.c_str(), (int)ds, card_mood_ ? ", card" : "");
+        requested_state_ = mood_key;
+    }
+    if (card_mood_ && card_drain_ >= 0) avatar_set_param(&av_, "level", card_drain_);   // a timer card's tide
     float lvl = PlaybackLevel(now_us);
     // Only Skipper's voice drives the swell, not the UI sounds (wake chime, Wi-Fi prompts).
     if (lvl >= 0 && (ds == kDeviceStateSpeaking || lvl == 0)) avatar_feed(&av_, lvl, 0.5f);
@@ -362,6 +396,35 @@ void AvatarDisplay::ApplyInputs(int64_t now_us, float* frame_period_ms) {
     *frame_period_ms = ps ? 100 : 33;
 }
 
+
+void AvatarDisplay::UpdateCards(int64_t now_us, bool idle, std::string* want) {
+    bool ring = false;
+    const Card* c = cards_.Tick(now_us, &ring);
+    if (ring) avatar_tap(&av_);   // a finished timer rings
+    auto events = cards_.TakeEvents();
+    if (!events.empty()) {
+        for (const auto& e : events) ESP_LOGI(TAG, "card %s: %s", e.first.c_str(), e.second.c_str());
+        {
+            std::lock_guard<std::mutex> lk(card_ev_mutex_);
+            for (auto& e : events) if (card_events_.size() < 16) card_events_.push_back(std::move(e));
+        }
+        if (card_task_) xTaskNotifyGive(card_task_);
+    }
+    card_mood_ = false;
+    card_drain_ = -1;
+    if (c == nullptr || !idle) return;
+    card_mood_ = true;
+    card_mood_id_ = c->id;
+    card_params_.assign(c->set, c->set + c->nset);
+    *want = c->mood.empty() ? "steady" : c->mood;
+    if (c->kind == CardKind::Timer && c->has_ends && c->done_us == 0) {
+        // The tide drains as the countdown runs, capped at 10% of the screen (Jerry's default).
+        float total = c->total > 0 ? c->total : 600;
+        card_drain_ = std::min(0.1f, c->drain) * std::clamp(1 - CardSet::Left(*c, now_us) / total, 0.0f, 1.0f);
+    } else if (c->kind == CardKind::Timer && c->done_us) {
+        card_drain_ = 0;   // finished: the tide comes back in
+    }
+}
 
 int AvatarDisplay::AddWrapped(const std::string& text, int y, int max_width, int max_lines, bool amber) {
     const pf_font_t& f = pf_text;
@@ -471,7 +534,7 @@ void AvatarDisplay::PollTouch(int64_t now_us) {
             touch_t0_ = now_us;
             touch_x0_ = touch_x_ = x;
             touch_y0_ = touch_y_ = y;
-            gesture_dial_ = gesture_swipe_ = gesture_long_ = gesture_moved_ = false;
+            gesture_dial_ = gesture_swipe_ = gesture_long_ = gesture_moved_ = gesture_card_ = false;
             dial_angle_ = atan2f(y - R, x - R);
             dial_accum_ = 0;
             gesture_volume_ = gesture_base_ = current_volume_.load();
@@ -485,7 +548,11 @@ void AvatarDisplay::PollTouch(int64_t now_us) {
         float d0 = hypotf(touch_x0_ - R, touch_y0_ - R);
         int new_volume = gesture_volume_;
         if (gesture_moved_ && !gesture_long_) {
-            if (d0 > R * 0.68f && !gesture_swipe_) {
+            if (gesture_card_ || (d0 <= R * 0.68f && !gesture_swipe_ && cards_.LiveCount() > 0 && fabsf(mx) > 1.5f * fabsf(my))) {
+                // Sideways in the middle with cards live: drag the showing card (swipe on release).
+                gesture_card_ = true;
+                cards_.Drag(mx);
+            } else if (d0 > R * 0.68f && !gesture_swipe_) {
                 // Rim dial: every 15 degrees clockwise = +5, counter-clockwise = -5.
                 gesture_dial_ = true;
                 float a = atan2f(y - R, x - R), da = a - dial_angle_;
@@ -510,7 +577,10 @@ void AvatarDisplay::PollTouch(int64_t now_us) {
             ShowVolume(new_volume);
             if (volume_cb_) volume_cb_(new_volume);
         }
-        if (!gesture_moved_ && !gesture_long_ && now_us - touch_t0_ > 700000) {
+        if (!gesture_moved_ && !gesture_long_ && now_us - touch_t0_ > 700000 && cards_.Showing()) {
+            gesture_long_ = true;   // hold dismisses the showing card (declines a call)
+            cards_.Hold(now_us);
+        } else if (!gesture_moved_ && !gesture_long_ && now_us - touch_t0_ > 700000) {
             gesture_long_ = true;
             if (long_press_cb_) long_press_cb_();
             std::lock_guard<std::mutex> lk(in_mutex_);
@@ -520,8 +590,13 @@ void AvatarDisplay::PollTouch(int64_t now_us) {
         }
     } else if (touching_) {
         touching_ = false;
-        if (!gesture_moved_ && !gesture_long_ && now_us - touch_t0_ < 500000) {
+        if (gesture_card_) {
+            float mx = touch_x_ - touch_x0_;
+            cards_.Drag(0);
+            if (fabsf(mx) > 50 || fabsf(mx) / std::max(0.01f, (now_us - touch_t0_) / 1e6f) > 500) cards_.Swipe(mx < 0 ? 1 : -1, now_us);
+        } else if (!gesture_moved_ && !gesture_long_ && now_us - touch_t0_ < 500000) {
             ESP_LOGI(TAG, "tap at %d,%d", (int)touch_x0_, (int)touch_y0_);
+            if (cards_.Showing()) cards_.Tap(now_us);   // pins a glance, plays a message, answers a call
             std::lock_guard<std::mutex> lk(in_mutex_);
             taps_++;
         }
@@ -548,27 +623,22 @@ void AvatarDisplay::SetScale(int scale) {
     force_full_ = true;
 }
 
-bool AvatarDisplay::OverlayInRows(int y0, int y1) {
-    if (volume_arc_) return true;   // the whole rim
-    for (int i = 0; i < text_count_; i++) {
-        const pf_font_t& f = text_[i].big ? pf_big : pf_text;
-        if (text_[i].y < y1 && text_[i].y + f.line_h > y0) return true;
-    }
-    if (low_battery_ && y1 > height_ - 41 && y0 < height_ - 27) return true;
-    return false;
-}
-
-void AvatarDisplay::RenderRows(int y0, int y1, bool clip) {
+void AvatarDisplay::RenderRows(int y0, int y1, bool clip, int cx0, int cx1) {
     for (int y = y0; y < y1; y += kBandRows) {
         int yb1 = std::min(y + kBandRows, y1);
         int spans[4][2] = {{0, width_}}, nspans = 1;
-        if (clip && scale_ == 1 && !OverlayInRows(y, yb1)) {
+        if (cx0 >= 0 && scale_ == 1) {
+            spans[0][0] = cx0;
+            spans[0][1] = cx1;
+        } else if (clip && scale_ == 1) {
             // Away from the horizon only the light's reach and the tap ripples' rings can change:
-            // send just those columns (avatar_band_spans, even-aligned for the CO5300).
+            // send just those columns (avatar_band_spans, even-aligned for the CO5300). Overlays are
+            // drawn inside each span, so text and arcs there stay right.
             nspans = avatar_band_spans(&shape_, &shape_prev_, y, yb1, width_, spans);
         }
         for (int k = 0; k < nspans; k++) {
             const int x0 = spans[k][0], x1 = spans[k][1], w = x1 - x0;
+            if (w <= 0) continue;
             int64_t t0 = esp_timer_get_time();
             xSemaphoreTake(buf_free_, portMAX_DELAY);
             int64_t t1 = esp_timer_get_time();
@@ -585,7 +655,7 @@ void AvatarDisplay::RenderRows(int y0, int y1, bool clip) {
                     for (int x = 0; x < hw; x++) dst[2 * x] = dst[2 * x + 1] = src[x];
                 }
             }
-            if (w == width_) DrawOverlays(buf, y, yb1);   // (clipped spans never hold overlays)
+            DrawOverlays(buf, w, x0, x1, y, yb1);
             int64_t t2 = esp_timer_get_time();
             FlushJob job = {buf, x0, y, x1, yb1};
             xQueueSend(flush_q_, &job, portMAX_DELAY);
@@ -597,8 +667,8 @@ void AvatarDisplay::RenderRows(int y0, int y1, bool clip) {
     }
 }
 
-void AvatarDisplay::DrawText(uint16_t* band, int y0, int y1, const std::string& text, int y_top, bool big,
-                             const float rgb[3]) {
+void AvatarDisplay::DrawText(uint16_t* band, int stride, int x0, int x1, int y0, int y1, const std::string& text,
+                             int y_top, bool big, const float rgb[3]) {
     const pf_font_t& f = big ? pf_big : pf_text;
     if (y_top >= y1 || y_top + f.line_h <= y0) return;
     int x = (width_ - TextWidth(f, text)) / 2;
@@ -606,44 +676,37 @@ void AvatarDisplay::DrawText(uint16_t* band, int y0, int y1, const std::string& 
         auto g = Glyph(f, ch);
         if (g == nullptr) { x += f.glyphs[0].adv; continue; }
         int gx = x + g->xo, gy = y_top + g->yo;
-        for (int r = std::max(gy, y0); r < std::min(gy + g->h, y1); r++) {
-            uint16_t* row = band + (r - y0) * width_;
-            for (int c = 0; c < g->w; c++) {
-                int px = gx + c;
-                if (px < 0 || px >= width_) continue;
-                int idx = (r - gy) * g->w + c;
-                uint8_t byte = f.bitmap[g->off + idx / 2];
-                int a = (idx & 1) ? (byte & 15) : (byte >> 4);
-                if (a) Blend(&row[px], rgb, a / 15.0f);
+        if (gx < x1 && gx + g->w > x0)
+            for (int r = std::max(gy, y0); r < std::min(gy + g->h, y1); r++) {
+                uint16_t* row = band + (r - y0) * stride - x0;
+                for (int c = std::max(0, x0 - gx); c < g->w && gx + c < x1; c++) {
+                    int idx = (r - gy) * g->w + c;
+                    uint8_t byte = f.bitmap[g->off + idx / 2];
+                    int a = (idx & 1) ? (byte & 15) : (byte >> 4);
+                    if (a) Blend(&row[gx + c], rgb, a / 15.0f);
+                }
             }
-        }
         x += g->adv;
     }
 }
 
-void AvatarDisplay::DrawVolumeArc(uint16_t* band, int y0, int y1) {
-    porthole_volume_arc(band, width_, y0, y1, volume_shown_);   // avatar_overlay.h
+void AvatarDisplay::DrawCards(uint16_t* band, int stride, int x0, int x1, int y0, int y1) {
+    porthole_draw_cards(card_layer_, &av_, scale_, width_, band, stride, x0, x1, y0, y1);   // avatar_card_draw.h
 }
 
 void AvatarDisplay::RimArcRows(float a, float b, int* y0, int* y1) {
     porthole_rim_arc_rows(width_, height_, a, b, y0, y1);
 }
 
-void AvatarDisplay::DrawOverlays(uint16_t* band, int y0, int y1) {
-    if (volume_arc_) DrawVolumeArc(band, y0, y1);
+void AvatarDisplay::DrawOverlays(uint16_t* band, int stride, int x0, int x1, int y0, int y1) {
+    DrawCards(band, stride, x0, x1, y0, y1);
     for (int i = 0; i < text_count_; i++) {
         const auto& t = text_[i];
-        DrawText(band, y0, y1, t.text, t.y, t.big, t.amber ? kAmber : kBone);
+        DrawText(band, stride, x0, x1, y0, y1, t.text, t.y, t.big, t.amber ? kAmber : kBone);
     }
-    if (low_battery_) {
-        // A small amber dot low in the sea: battery at 15% or less.
-        const float cx = width_ / 2.0f, cy = height_ - 34.0f, rr = 5.0f;
-        for (int y = std::max(y0, (int)(cy - rr - 1)); y < std::min(y1, (int)(cy + rr + 2)); y++)
-            for (int x = (int)(cx - rr - 1); x <= (int)(cx + rr + 1); x++) {
-                float d = hypotf(x + 0.5f - cx, y + 0.5f - cy);
-                Blend(&band[(y - y0) * width_ + x], kAmber, std::clamp(rr - d + 0.5f, 0.0f, 1.0f));
-            }
-    }
+    if (volume_arc_) porthole_volume_arc(band, stride, x0, x1, width_, y0, y1, volume_shown_);   // avatar_overlay.h
+    // A small amber dot low in the sea: battery at 15% or less.
+    if (low_battery_) porthole_dot(band, stride, x0, x1, y0, y1, width_ / 2.0f, height_ - 34.0f, 5.0f, kAmber, 1.0f);
 }
 
 void AvatarDisplay::RenderLoop() {
@@ -664,6 +727,15 @@ void AvatarDisplay::RenderLoop() {
         for (int i = 0; i < 3; i++) av_.cur.sky[i] = av_.tgt.sky[i] = 0;
         avatar_settle(&av_);
         avatar_prepare(&av_, &frame_);
+
+        // Cards: lay out this frame's text (on the sea, below the horizon's rest height) and find
+        // what changed since the last frame: the text box, the dots and the rim progress.
+        cards_.Layout(frame_start, (float)width_, width_ * (0.5f + av_.cur.level), &card_layer_);
+        uint32_t csig;
+        int cbox[4];
+        porthole_card_damage(card_layer_, width_, height_, &csig, cbox);
+        float carc = card_layer_.arc > 0 ? roundf(card_layer_.arc * 2000) / 2000 : -1;
+        card_layer_.arc = carc;
 
         // Rows outside the active span only change with the sea/rim colours, the overlays, or
         // (rim rows only) the timer sweep and the volume level.
@@ -704,6 +776,23 @@ void AvatarDisplay::RenderLoop() {
                 avatar_sweep_rows(&frame_, prev_sweep_, sweep, &s0, &s1);
                 add_span(s0 * scale_, s1 * scale_);
             }
+            // Cards: the old and new text boxes (only their columns), the rim between the old and new progress.
+            if (csig != card_sig_) {
+                int b[4] = {cbox[0], cbox[1], cbox[2], cbox[3]};
+                if (card_box_[2] > card_box_[0]) {
+                    b[0] = std::min(b[0], card_box_[0]); b[1] = std::min(b[1], card_box_[1]);
+                    b[2] = std::max(b[2], card_box_[2]); b[3] = std::max(b[3], card_box_[3]);
+                }
+                card_rect_[0] = std::max(0, b[0]) & ~1;
+                card_rect_[1] = std::max(0, b[1]) & ~1;
+                card_rect_[2] = std::min(width_, (b[2] + 1) & ~1);
+                card_rect_[3] = std::min(height_, (b[3] + 1) & ~1);
+            }
+            if (carc != card_arc_drawn_) {
+                int s0, s1;
+                RimArcRows(2 * kPi * std::max(0.0f, carc), 2 * kPi * std::max(0.0f, card_arc_drawn_), &s0, &s1);
+                add_span(s0, s1);
+            }
             // A new volume level: the rim between the old and new level, and the number.
             if (vsig >= 0 && volume_sig_ >= 0 && vsig != volume_sig_) {
                 int s0, s1;
@@ -723,6 +812,13 @@ void AvatarDisplay::RenderLoop() {
             else spans[merged++] = spans[i];
         }
         if (act1 > act0) RenderRows(act0, act1, !full);
+        if (!full && card_rect_[2] > card_rect_[0] && card_rect_[3] > card_rect_[1])
+            RenderRows(card_rect_[1], card_rect_[3], false, card_rect_[0], card_rect_[2]);
+        card_rect_[2] = card_rect_[0] = 0;
+        card_sig_ = csig;
+        card_arc_drawn_ = carc;
+        if (cbox[2] > cbox[0]) std::copy(cbox, cbox + 4, card_box_);
+        else card_box_[0] = card_box_[2] = 0;
         for (int i = 0; i < merged; i++) RenderRows(spans[i].a, spans[i].b, false);   // rim sweeps: whole rows
         shape_prev_ = shape_;
         static_sig_ = sig;
@@ -762,3 +858,87 @@ void AvatarDisplay::RenderLoop() {
         xSemaphoreTake(pace_, portMAX_DELAY);
     }
 }
+
+// ------------------------------------------------------------------ card client
+// Between conversations the bridge's WebSocket is closed, so poll the live card set over HTTP with
+// the WebSocket's credentials (avatar-spec PROTOCOL.md "Cards"). During a conversation the bridge
+// pushes cards on the WebSocket instead (Application -> ShowCard). Card events are posted.
+
+void AvatarDisplay::CardClientEntry(void* arg) { static_cast<AvatarDisplay*>(arg)->CardClientLoop(); }
+
+bool AvatarDisplay::CardHttp(const char* method, const std::string& path, const std::string& body, std::string* reply) {
+    Settings wifi("wifi", false);
+    std::string url = wifi.GetString("ota_url");
+    if (url.empty()) url = CONFIG_OTA_URL;
+    size_t k = url.rfind("/ota");
+    if (k == std::string::npos) return false;
+    url = url.substr(0, k) + path;   // .../xiaozhi/ota/ -> .../xiaozhi/cards/
+    Settings ws("websocket", false);
+    std::string token = ws.GetString("token");
+    auto network = Board::GetInstance().GetNetwork();
+    if (network == nullptr) return false;
+    auto http = network->CreateHttp(0);
+    if (!http) return false;
+    http->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
+    http->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
+    if (!token.empty()) http->SetHeader("Authorization", (token.find(' ') == std::string::npos ? "Bearer " + token : token).c_str());
+    http->SetHeader("User-Agent", SystemInfo::GetUserAgent().c_str());
+    if (!body.empty()) {
+        http->SetHeader("Content-Type", "application/json");
+        http->SetContent(std::string(body));
+    }
+    if (!http->Open(method, url)) return false;
+    auto status = http->GetStatusCode();
+    bool ok = status && *status == 200;
+    if (ok && reply) *reply = http->ReadAll();
+    http->Close();
+    if (!ok) ESP_LOGW(TAG, "cards %s %s: %d", method, path.c_str(), status ? *status : -1);
+    return ok;
+}
+
+void AvatarDisplay::CardClientLoop() {
+    int poll_s = 30;
+    int64_t next_poll = esp_timer_get_time() + 20000000;   // let Wi-Fi and the OTA check settle first
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+        DeviceState ds;
+        bool ps;
+        {
+            std::lock_guard<std::mutex> lk(in_mutex_);
+            ds = device_state_;
+            ps = power_save_;
+        }
+        const bool online = ds == kDeviceStateIdle || ds == kDeviceStateListening || ds == kDeviceStateSpeaking;
+        std::vector<std::pair<std::string, std::string>> events;
+        {
+            std::lock_guard<std::mutex> lk(card_ev_mutex_);
+            events.swap(card_events_);
+        }
+        for (const auto& e : events) {
+            if (!online) break;
+            cJSON* o = cJSON_CreateObject();
+            cJSON_AddStringToObject(o, "type", "card_event");
+            cJSON_AddStringToObject(o, "id", e.first.c_str());
+            cJSON_AddStringToObject(o, "event", e.second.c_str());
+            char* js = cJSON_PrintUnformatted(o);
+            if (js) { CardHttp("POST", "/cards/event", js, nullptr); cJSON_free(js); }
+            cJSON_Delete(o);
+            next_poll = std::min(next_poll, esp_timer_get_time() + 1500000);   // pick up the bridge's reaction
+        }
+        int64_t now = esp_timer_get_time();
+        if (ds != kDeviceStateIdle || now < next_poll) continue;
+        std::string reply;
+        if (CardHttp("GET", "/cards/", "", &reply)) {
+            cJSON* root = cJSON_Parse(reply.c_str());
+            if (root) {
+                const cJSON* p = cJSON_GetObjectItem(root, "poll");
+                if (cJSON_IsNumber(p)) poll_s = std::clamp(p->valueint, 10, 600);
+                cJSON_Delete(root);
+                std::lock_guard<std::mutex> lk(in_mutex_);
+                card_poll_ = std::move(reply);
+            }
+        }
+        next_poll = esp_timer_get_time() + (int64_t)(ps ? std::max(poll_s, 120) : poll_s) * 1000000;
+    }
+}
+

@@ -7,6 +7,7 @@
 #include "device_state.h"
 #include "avatar.h"
 #include "avatar_dirty.h"
+#include "avatar_cards.h"
 
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
@@ -21,6 +22,8 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 class AvatarDisplay : public Display {
 public:
@@ -39,6 +42,7 @@ public:
     void ClearChatMessages() override;
     void UpdateStatusBar(bool update_all = false) override;
     void SetPowerSaveMode(bool on) override;
+    void ShowCard(const std::string& json) override;   // any task
 
     // Board hooks (any task)
     void OnDeviceState(DeviceState state);
@@ -116,6 +120,8 @@ private:
     bool charging_ = false, discharging_ = false;
     int64_t battery_until_us_ = 0;
     int taps_ = 0;
+    std::vector<std::string> card_msgs_;   // pushed {"type":"card",…} messages, oldest first
+    std::string card_poll_;                // the latest poll reply (the whole live set)
 
     // Playback level ring: 10 ms windows with the time they reach the speaker.
     static constexpr int kLevelRing = 64;
@@ -149,11 +155,30 @@ private:
     std::function<void()> long_press_cb_;
     std::function<void()> activity_cb_;
 
+    // Cards (render task).
+    CardSet cards_;
+    CardLayer card_layer_;
+    uint32_t card_sig_ = 0;
+    int card_box_[4] = {0, 0, 0, 0};
+    int card_rect_[4] = {0, 0, 0, 0};  // this frame's card redraw rectangle (x0, y0, x1, y1)   // last drawn card text box (x0, y0, x1, y1), empty if x1 <= x0
+    float card_arc_drawn_ = -1;        // rim progress last drawn (-1: none)
+    std::string card_mood_id_;         // card whose mood/params were applied
+    bool card_mood_ = false;           // the avatar state comes from a card
+    std::vector<CardParam> card_params_;   // that card's `set`
+    float card_drain_ = -1;            // a running timer card's tide level (-1: none)
+    // Card client task: polls GET <bridge>/xiaozhi/cards/ between conversations, posts card events.
+    TaskHandle_t card_task_ = nullptr;
+    std::mutex card_ev_mutex_;
+    std::vector<std::pair<std::string, std::string>> card_events_;
+    static void CardClientEntry(void* arg);
+    void CardClientLoop();
+    bool CardHttp(const char* method, const std::string& path, const std::string& body, std::string* reply);
+
     // Touch gesture state.
     bool touching_ = false;
     int64_t touch_t0_ = 0;
     float touch_x0_ = 0, touch_y0_ = 0, touch_x_ = 0, touch_y_ = 0;
-    bool gesture_dial_ = false, gesture_swipe_ = false, gesture_long_ = false, gesture_moved_ = false;
+    bool gesture_dial_ = false, gesture_swipe_ = false, gesture_long_ = false, gesture_moved_ = false, gesture_card_ = false;
     float dial_angle_ = 0, dial_accum_ = 0;
     int gesture_volume_ = -1, gesture_base_ = 0;
     bool touch_error_logged_ = false;
@@ -173,11 +198,14 @@ private:
     void ApplyInputs(int64_t now_us, float* frame_period_ms);
     float PlaybackLevel(int64_t now_us);
     void ActiveRows(int* y0, int* y1);
-    void RenderRows(int y0, int y1, bool clip);   // clip: only the column spans avatar_band_spans allows
-    bool OverlayInRows(int y0, int y1);
-    void DrawOverlays(uint16_t* band, int y0, int y1);
-    void DrawText(uint16_t* band, int y0, int y1, const std::string& text, int y_top, bool big, const float rgb[3]);
-    void DrawVolumeArc(uint16_t* band, int y0, int y1);
+    // clip: only the column spans avatar_band_spans allows; cx0 >= 0: exactly columns [cx0, cx1).
+    void RenderRows(int y0, int y1, bool clip, int cx0 = -1, int cx1 = -1);
+    // Overlays over rows [y0, y1), columns [x0, x1) of a band (stride px per row, column x0 at band[0]).
+    void DrawOverlays(uint16_t* band, int stride, int x0, int x1, int y0, int y1);
+    void DrawText(uint16_t* band, int stride, int x0, int x1, int y0, int y1, const std::string& text, int y_top, bool big,
+                  const float rgb[3]);
+    void DrawCards(uint16_t* band, int stride, int x0, int x1, int y0, int y1);
+    void UpdateCards(int64_t now_us, bool idle, std::string* want);
     void RimArcRows(float a, float b, int* y0, int* y1);
     void BuildText(int64_t now_us);
     int AddWrapped(const std::string& text, int y, int max_width, int max_lines, bool amber);

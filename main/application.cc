@@ -719,6 +719,9 @@ void Application::InitializeProtocol() {
                     }
                 });
             }
+        } else if (strcmp(type->valuestring, "card") == 0) {
+            CJsonStringUniquePtr json(cJSON_PrintUnformatted(root));
+            if (json) display->ShowCard(json.get());
         } else if (strcmp(type->valuestring, "mcp") == 0) {
             auto payload = cJSON_GetObjectItem(root, "payload");
             if (cJSON_IsObject(payload)) {

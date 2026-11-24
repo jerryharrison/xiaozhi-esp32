@@ -1,6 +1,6 @@
 /* Host check for the Porthole's volume arc (avatar_overlay.h) under the device's partial redraws.
- * Runs AvatarDisplay::RenderLoop's row/column logic (active rows, column clipping, overlays on
- * full-width bands only, the rim rows between the old and new level) over:
+ * Runs AvatarDisplay::RenderLoop's row/column logic (active rows with column clipping, the arc drawn
+ * inside every span, the rim rows between the old and new level) over:
  *   - a drag: the level 0 -> 100 -> 0 in steps of 5, one step every 2-3 frames, with a moving swell
  *   - every level 0..100 held still (the arc's end at every angle, incl. 12 and 6 o'clock)
  *   - taps and listening rings while the arc shows
@@ -80,21 +80,27 @@ int main(void) {
       }
     }
     vsig_prev = vsig;
-    /* RenderRows(act, clip=!full): the arc is on, so OverlayInRows is true: full-width bands + overlays */
+    /* RenderRows(act, clip=!full): column spans (avatar_band_spans), the arc drawn inside each span
+     * (overlays are column-aware); then the rim rows between the old and new level, whole rows. */
     for (int pass = 0; pass < 2; pass++) {
       int y0 = pass ? s0 : act0, y1 = pass ? s1 : act1;
       for (int by = y0; by < y1; by += BAND) {
         int by1 = by + BAND < y1 ? by + BAND : y1;
-        avatar_render_cols(&av, &fr, bandbuf, W, by, by1, 1, 0, W, AVATAR_RGB565_SWAP);
-        porthole_volume_arc(bandbuf, W, by, by1, level);
-        memcpy(panel + by * W, bandbuf, sizeof(uint16_t) * W * (by1 - by));
+        int sp[4][2] = {{0, W}}, ns = 1;
+        if (!full && pass == 0) ns = avatar_band_spans(&shape, &shape_prev, by, by1, W, sp);
+        for (int k = 0; k < ns; k++) {
+          int cx0 = sp[k][0], cx1 = sp[k][1], w = cx1 - cx0;
+          avatar_render_cols(&av, &fr, bandbuf, w, by, by1, 1, cx0, cx1, AVATAR_RGB565_SWAP);
+          porthole_volume_arc(bandbuf, w, cx0, cx1, W, by, by1, level);
+          for (int r = by; r < by1; r++) memcpy(panel + r * W + cx0, bandbuf + (r - by) * w, sizeof(uint16_t) * w);
+        }
       }
     }
     shape_prev = shape;
     last_sig = sig; prev0 = a0; prev1 = a1; first = 0;
 
     avatar_render_frame(&av, &fr, ref, W, 0, W, 1, AVATAR_RGB565_SWAP);
-    porthole_volume_arc(ref, W, 0, W, level);
+    porthole_volume_arc(ref, W, 0, W, W, 0, W, level);
     long bad = 0;
     for (int i = 0; i < W * W; i++) bad += panel[i] != ref[i];
     if (bad) { bad_frames++; bad_px += bad; if (bad_frames <= 5) printf("frame %d level %d: %ld px differ from a full render\n", f, level, bad); }

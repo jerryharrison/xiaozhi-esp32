@@ -54,17 +54,20 @@ static inline float ph_sqrt(float x) {
 #define PORTHOLE_ARC_LEGACY 0   // 1: the pre-2026-11-24 span bug, for the regression check only
 #endif
 
-// The volume level in the avatar's own language: the bone rim turns amber clockwise from 12 o'clock
-// up to `level` (0..100), like the timer's tide sweep; the rest of the rim dims to slate. Draws rows
-// [y0, y1) of a band that holds full rows of `width` pixels (row y0 at band[0]).
+// The rim ring turns amber clockwise from 12 o'clock up to `frac` (0..1). With `slate_rest`, the
+// rest of the ring dims to slate (the volume level); without, it keeps the bone rim (a card's
+// progress). Draws rows [y0, y1), columns [x0, x1) of a screen `width` px across into `band`
+// (row y0, column x0 at band[0]; `stride` pixels per row).
 //
 // Every pixel of the rim ring is visited on both sides of the centre column. (Before 2026-11-24 the
 // rows above and below the rim's inner edge, 12 and 6 o'clock, only got their left half, so the bone
 // rim showed through just right of 12 and 6 o'clock.)
-static inline void porthole_volume_arc(uint16_t* band, int width, int y0, int y1, int level) {
+static inline void porthole_rim_arc(uint16_t* band, int stride, int x0, int x1, int width, int y0, int y1, float frac,
+                                    int slate_rest) {
     const float R = width / 2.0f, rim = width * PORTHOLE_RIM_FRAC, rc = R - rim / 2;
     const float ro = R + 0.5f, ri = R - rim - 1;
-    const float sweep = 2 * PORTHOLE_PI * ph_clampi(level, 0, 100) / 100.0f;
+    frac = ph_clampf(frac, 0, 1);
+    const float sweep = 2 * PORTHOLE_PI * frac;
     // Clockwise from 12 o'clock up to `sweep`, by cross products with the sweep's direction.
     const float wx = sinf(sweep), wy = -cosf(sweep);
     const int big = sweep > PORTHOLE_PI;
@@ -72,26 +75,47 @@ static inline void porthole_volume_arc(uint16_t* band, int width, int y0, int y1
         float dy = y + 0.5f - R;
         if (fabsf(dy) >= ro) continue;
         float xo = ph_sqrt(ro * ro - dy * dy), xi = fabsf(dy) < ri ? ph_sqrt(ri * ri - dy * dy) : 0;
-        uint16_t* row = band + (y - y0) * width;
+        uint16_t* row = band + (y - y0) * stride - x0;
         // The ring's columns in this row: two spans, or one across the centre where the row passes
         // above/below the inner edge.
         int spans[2][2] = {{(int)(R - xo), (int)(R - xi) + 1}, {(int)(R + xi), (int)(R + xo) + 1}};
         int n = 2;
         if (xi == 0) { if (!PORTHOLE_ARC_LEGACY) spans[0][1] = spans[1][1]; n = 1; }
         for (int s = 0; s < n; s++) {
-            int xa = spans[s][0] < 0 ? 0 : spans[s][0], xb = spans[s][1] > width ? width : spans[s][1];
+            int xa = spans[s][0] < x0 ? x0 : spans[s][0], xb = spans[s][1] > x1 ? x1 : spans[s][1];
             for (int x = xa; x < xb; x++) {
                 float dx = x + 0.5f - R, d = ph_sqrt(dx * dx + dy * dy);
                 float cov = ph_clampf(rim / 2 - fabsf(d - rc) + 0.5f, 0.0f, 1.0f);
                 if (cov <= 0) continue;
                 float cr = dx * wy - dy * wx;   // > 0: the sweep direction is clockwise of (dx, dy)
                 int lit = big ? !(dx < 0 && cr < 0) : (dx >= 0 && cr >= 0);
-                if (!PORTHOLE_ARC_LEGACY) lit = level >= 100 ? 1 : level <= 0 ? 0 : lit;
+                if (!PORTHOLE_ARC_LEGACY) lit = frac >= 1 ? 1 : frac <= 0 ? 0 : lit;
                 if (lit) ph_blend(&row[x], kPhAmber, cov);
-                else ph_blend(&row[x], kPhSlate, cov * 0.8f);
+                else if (slate_rest) ph_blend(&row[x], kPhSlate, cov * 0.8f);
             }
         }
     }
+}
+
+// The volume level (0..100) in the avatar's own language: the bone rim turns amber clockwise from
+// 12 o'clock up to the level, like the timer's tide sweep; the rest of the rim dims to slate.
+static inline void porthole_volume_arc(uint16_t* band, int stride, int x0, int x1, int width, int y0, int y1, int level) {
+    porthole_rim_arc(band, stride, x0, x1, width, y0, y1, ph_clampi(level, 0, 100) / 100.0f, 1);
+}
+
+// A filled antialiased dot (centre cx, cy; radius r) in colour c at opacity a.
+static inline void porthole_dot(uint16_t* band, int stride, int x0, int x1, int y0, int y1, float cx, float cy, float r,
+                                const float c[3], float a) {
+    int ya = (int)(cy - r - 1), yb = (int)(cy + r + 2), xa = (int)(cx - r - 1), xb = (int)(cx + r + 2);
+    if (ya < y0) ya = y0;
+    if (yb > y1) yb = y1;
+    if (xa < x0) xa = x0;
+    if (xb > x1) xb = x1;
+    for (int y = ya; y < yb; y++)
+        for (int x = xa; x < xb; x++) {
+            float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
+            ph_blend(&band[(y - y0) * stride + x - x0], c, a * ph_clampf(r - ph_sqrt(dx * dx + dy * dy) + 0.5f, 0.0f, 1.0f));
+        }
 }
 
 // Panel rows of the rim sector between angles a and b (radians clockwise from 12 o'clock).
