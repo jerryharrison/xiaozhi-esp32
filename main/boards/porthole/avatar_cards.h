@@ -36,6 +36,7 @@ struct Card {
     // runtime
     int64_t answered_us = 0, done_us = 0, play_us = 0, last_ring_us = 0;
     bool seen = false;       // has surfaced at least once (else it waits for a free screen)
+    double raw_ends_ms = 0;  // the sender's ends_at, unshifted (restart detection)
 };
 
 // One line of card text to draw this frame.
@@ -413,12 +414,13 @@ private:
             return now_us + (int64_t)((ms - ref) * 1000.0);
         };
         const cJSON* pr = cJSON_GetObjectItem(m, "progress");
-        const int64_t old_ends = n.has_ends ? n.ends_us : 0;
+        const double old_raw = n.raw_ends_ms;
         if (pr) n.has_value = n.has_ends = false;
         if (cJSON_IsObject(pr)) {
             if (cJSON_IsNumber(cJSON_GetObjectItem(pr, "ends_at"))) {
                 n.has_ends = true;
-                n.ends_us = to_local(Num(pr, "ends_at", 0));
+                n.raw_ends_ms = Num(pr, "ends_at", 0);
+                n.ends_us = to_local(n.raw_ends_ms);
                 n.total = (float)Num(pr, "total", 0);
                 if (sender_ms <= 0) n.has_ends = false;   // can't place it in time
             } else if (cJSON_IsNumber(cJSON_GetObjectItem(pr, "value"))) {
@@ -427,7 +429,8 @@ private:
             }
             n.done = Str(pr, "done");
         }
-        if (n.done_us && n.has_ends && llabs(n.ends_us - old_ends) > 1500000 && n.ends_us > now_us) n.done_us = n.last_ring_us = 0;   // restarted
+        // restarted: the sender moved the deadline (compared unshifted) into the future
+        if (n.done_us && n.has_ends && n.raw_ends_ms != old_raw && n.ends_us > now_us) n.done_us = n.last_ring_us = 0;
         if (has("expires_at")) n.expires_us = cJSON_IsNumber(cJSON_GetObjectItem(m, "expires_at")) && sender_ms > 0 ? to_local(Num(m, "expires_at", 0)) : 0;
         if (n.expires_us && n.expires_us <= now_us) { if (old) Remove(id, now_us); return old != nullptr; }
         if (old) {
