@@ -173,7 +173,7 @@ private:
     void ApplyInputs(int64_t now_us, float* frame_period_ms);
     float PlaybackLevel(int64_t now_us);
     void ActiveRows(int* y0, int* y1);
-    void RenderRows(int y0, int y1, bool clip);   // clip: only the columns avatar_band_cols allows
+    void RenderRows(int y0, int y1, bool clip);   // clip: only the column spans avatar_band_spans allows
     bool OverlayInRows(int y0, int y1);
     void DrawOverlays(uint16_t* band, int y0, int y1);
     void DrawText(uint16_t* band, int y0, int y1, const std::string& text, int y_top, bool big, const float rgb[3]);

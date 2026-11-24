@@ -1,5 +1,5 @@
 /* Host check for the Porthole's partial redraws: runs a scripted session (every mood, taps, a
- * voice swell, star, storm, quiet, a timer) and keeps a simulated panel updated only in the rows
+ * voice swell, star, storm, quiet, a timer, then rapid taps) and keeps a simulated panel updated only in the rows
  * AvatarDisplay would redraw (avatar_dirty.h + the colour signature), then compares it with a full
  * render every frame. Also reports how many rows per frame get redrawn.
  *
@@ -25,11 +25,12 @@ int main(int argc, char** argv) {
   avatar_init(&av, W);
   for (int i = 0; i < 3; i++) av.cur.sky[i] = av.tgt.sky[i] = 0;
   const float dt = 1 / fps;
-  int frames = (int)(48 * fps), prev0 = 0, prev1 = 0, rows = 0, fulls = 0, bad_frames = 0;
+  int frames = (int)(56 * fps), prev0 = 0, prev1 = 0, rows = 0, fulls = 0, bad_frames = 0;
   float prev_sweep = -1;
   avatar_dirty_t shape, shape_prev;
   static uint16_t bandbuf[W * BAND];
-  long px_sent = 0;
+  long px_sent = 0, px_taps = 0;
+  int f_taps = 0;
   long bad_px = 0;
   int maxdiff = 0;
   uint32_t last_sig = 0;
@@ -41,6 +42,8 @@ int main(int argc, char** argv) {
                    : t < 32 ? "storm" : t < 38 ? "quiet" : "steady";
     if (strcmp(st, last_state)) { avatar_set_state(&av, st); last_state = st; }
     if (fabsf(t - 6) < dt / 2 || fabsf(t - 30) < dt / 2 || fabsf(t - 40) < dt / 2) avatar_tap(&av);
+    if (t >= 48 && fmodf(t - 48 + dt / 2, 0.5f) < dt) avatar_tap(&av);   /* rapid taps: one every 0.5 s */
+    if (t >= 48 && t < 48 + dt / 2) { px_taps = px_sent; f_taps = f; }
     if (fabsf(t - 41) < dt / 2) avatar_countdown(&av, 5);   /* runs to t = 46, then steady */
     if (t >= 15 && t < 21) {   /* Skipper speaking: syllable-ish swell */
       float lv = 0.5f + 0.45f * sinf(t * 11) * sinf(t * 2.3f);
@@ -72,23 +75,20 @@ int main(int argc, char** argv) {
     }
     prev_sweep = sweep;
     /* (the sweep rows are rendered whole, after the clipped active rows, as AvatarDisplay does) */
-    avatar_dirty_shape(&av, &shape);
+    avatar_dirty_shape(&av, &fr, &shape);
     if (full) shape_prev = shape;
     double t0 = now_s();
-    /* active rows band by band, only the columns avatar_band_cols allows (as AvatarDisplay::RenderRows) */
+    /* active rows band by band, only the column spans avatar_band_spans allows (as AvatarDisplay::RenderRows) */
     for (int by = y0; by < y1; by += BAND) {
-      int by1 = by + BAND < y1 ? by + BAND : y1, cx0 = 0, cx1 = W;
-      if (!full) {
-        avatar_band_cols(&shape, &shape_prev, by, by1, W, &cx0, &cx1);
-        cx0 &= ~1;
-        cx1 = (cx1 + 1) & ~1;
-        if (cx1 > W) cx1 = W;
-        if (cx1 <= cx0) continue;
+      int by1 = by + BAND < y1 ? by + BAND : y1;
+      int sp[4][2] = {{0, W}}, ns = 1;
+      if (!full) ns = avatar_band_spans(&shape, &shape_prev, by, by1, W, sp);
+      for (int k = 0; k < ns; k++) {
+        int cx0 = sp[k][0], cx1 = sp[k][1], w = cx1 - cx0;
+        avatar_render_cols(&av, &fr, bandbuf, w, by, by1, 1, cx0, cx1, AVATAR_RGB565_SWAP);
+        for (int r = by; r < by1; r++) memcpy(panel + r * W + cx0, bandbuf + (r - by) * w, sizeof(uint16_t) * w);
+        px_sent += (long)(by1 - by) * w;
       }
-      int w = cx1 - cx0;
-      avatar_render_cols(&av, &fr, bandbuf, w, by, by1, 1, cx0, cx1, AVATAR_RGB565_SWAP);
-      for (int r = by; r < by1; r++) memcpy(panel + r * W + cx0, bandbuf + (r - by) * w, sizeof(uint16_t) * w);
-      px_sent += (long)(by1 - by) * w;
     }
     shape_prev = shape;
     if (s1 > s0) { avatar_render_frame(&av, &fr, panel + s0 * W, W, s0, s1, 1, AVATAR_RGB565_SWAP); rows += s1 - s0; px_sent += (long)(s1 - s0) * W; }
@@ -116,6 +116,7 @@ int main(int argc, char** argv) {
   }
   printf("%d frames at %.0f fps: %d rows/frame avg (%ld kpx sent), %d full redraws, %d frames with differences (%ld px, max green diff %d)\n",
          frames, fps, rows / frames, px_sent / frames / 1000, fulls, bad_frames, bad_px, maxdiff);
+  printf("rapid taps (t 48..56): %ld kpx sent per frame\n", (px_sent - px_taps) / (frames - f_taps) / 1000);
   printf("host time: partial %.2f ms/frame vs full %.2f ms/frame (%.0f%%)\n", t_partial * 1e3 / frames, t_full * 1e3 / frames,
          100 * t_partial / t_full);
   return bad_frames ? 1 : 0;

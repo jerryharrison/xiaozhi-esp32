@@ -2,6 +2,7 @@
 #include "avatar_display.h"
 #include "porthole_font.h"
 #include "avatar_dirty.h"
+#include "avatar_overlay.h"
 
 #include "board.h"
 #include "audio_codec.h"
@@ -19,38 +20,13 @@
 
 namespace {
 
-constexpr float kBone[3] = {237, 230, 214};
-constexpr float kAmber[3] = {242, 181, 68};
-constexpr float kSlate[3] = {47, 84, 104};
-constexpr float kRimFrac = 0.026f;   // spec.json geometry.rim
-constexpr float kPi = 3.14159265f;
+const float* const kBone = kPhBone;
+const float* const kAmber = kPhAmber;
+constexpr float kPi = PORTHOLE_PI;
 constexpr float kTimerMoodSeconds = 10;   // bridge mood "timer": how long the tide takes to drain
 
-// Multiply, don't divide: the S3 has no FPU divide (these run per pixel under text and the volume arc).
-inline uint16_t Pack(const float c[3]) {
-    int r = (int)(c[0] * (31.0f / 255) + 0.5f), g = (int)(c[1] * (63.0f / 255) + 0.5f), b = (int)(c[2] * (31.0f / 255) + 0.5f);
-    uint16_t v = (uint16_t)((std::clamp(r, 0, 31) << 11) | (std::clamp(g, 0, 63) << 5) | std::clamp(b, 0, 31));
-    return (uint16_t)((v >> 8) | (v << 8));
-}
-
-inline void Blend(uint16_t* px, const float c[3], float a) {
-    if (a <= 0) return;
-    if (a > 1) a = 1;
-    uint16_t v = (uint16_t)((*px >> 8) | (*px << 8));
-    float rgb[3] = {((v >> 11) & 31) * (255.0f / 31), ((v >> 5) & 63) * (255.0f / 63), (v & 31) * (255.0f / 31)};
-    for (int i = 0; i < 3; i++) rgb[i] += (c[i] - rgb[i]) * a;
-    *px = Pack(rgb);
-}
-
-// sqrt without libm (flash) or a divide: one rsqrt estimate and three Newton steps.
-inline float FastSqrt(float x) {
-    if (x <= 0) return 0;
-    union { float f; uint32_t i; } u = {x};
-    u.i = 0x5f375a86u - (u.i >> 1);
-    float y = u.f, h = 0.5f * x;
-    for (int i = 0; i < 3; i++) y = y * (1.5f - h * y * y);
-    return x * y;
-}
+// Pixel helpers live in avatar_overlay.h (shared with the host checks).
+inline void Blend(uint16_t* px, const float c[3], float a) { ph_blend(px, c, a); }
 
 const pf_glyph_t* Glyph(const pf_font_t& f, char ch) {
     const char* p = strchr(f.chars, ch);
@@ -585,40 +561,39 @@ bool AvatarDisplay::OverlayInRows(int y0, int y1) {
 void AvatarDisplay::RenderRows(int y0, int y1, bool clip) {
     for (int y = y0; y < y1; y += kBandRows) {
         int yb1 = std::min(y + kBandRows, y1);
-        int x0 = 0, x1 = width_;
+        int spans[4][2] = {{0, width_}}, nspans = 1;
         if (clip && scale_ == 1 && !OverlayInRows(y, yb1)) {
-            // Away from the horizon only the light's reach can change: send just those columns
-            // (even-aligned for the CO5300).
-            avatar_band_cols(&shape_, &shape_prev_, y, yb1, width_, &x0, &x1);
-            x0 &= ~1;
-            x1 = std::min(width_, (x1 + 1) & ~1);
-            if (x1 <= x0) continue;
+            // Away from the horizon only the light's reach and the tap ripples' rings can change:
+            // send just those columns (avatar_band_spans, even-aligned for the CO5300).
+            nspans = avatar_band_spans(&shape_, &shape_prev_, y, yb1, width_, spans);
         }
-        const int w = x1 - x0;
-        int64_t t0 = esp_timer_get_time();
-        xSemaphoreTake(buf_free_, portMAX_DELAY);
-        int64_t t1 = esp_timer_get_time();
-        uint16_t* buf = buf_[buf_next_];
-        buf_next_ = (buf_next_ + 1) % kBuffers;
-        if (scale_ == 1) {
-            RenderSplit(buf, w, y, yb1, x0, x1);
-        } else {
-            const int hw = width_ / 2, hy0 = y / 2, hy1 = (yb1 + 1) / 2;
-            RenderSplit(half_buf_, hw, hy0, hy1, 0, hw);
-            for (int r = y; r < yb1; r++) {
-                const uint16_t* src = half_buf_ + (r / 2 - hy0) * hw;
-                uint16_t* dst = buf + (r - y) * width_;
-                for (int x = 0; x < hw; x++) dst[2 * x] = dst[2 * x + 1] = src[x];
+        for (int k = 0; k < nspans; k++) {
+            const int x0 = spans[k][0], x1 = spans[k][1], w = x1 - x0;
+            int64_t t0 = esp_timer_get_time();
+            xSemaphoreTake(buf_free_, portMAX_DELAY);
+            int64_t t1 = esp_timer_get_time();
+            uint16_t* buf = buf_[buf_next_];
+            buf_next_ = (buf_next_ + 1) % kBuffers;
+            if (scale_ == 1) {
+                RenderSplit(buf, w, y, yb1, x0, x1);
+            } else {
+                const int hw = width_ / 2, hy0 = y / 2, hy1 = (yb1 + 1) / 2;
+                RenderSplit(half_buf_, hw, hy0, hy1, 0, hw);
+                for (int r = y; r < yb1; r++) {
+                    const uint16_t* src = half_buf_ + (r / 2 - hy0) * hw;
+                    uint16_t* dst = buf + (r - y) * width_;
+                    for (int x = 0; x < hw; x++) dst[2 * x] = dst[2 * x + 1] = src[x];
+                }
             }
+            if (w == width_) DrawOverlays(buf, y, yb1);   // (clipped spans never hold overlays)
+            int64_t t2 = esp_timer_get_time();
+            FlushJob job = {buf, x0, y, x1, yb1};
+            xQueueSend(flush_q_, &job, portMAX_DELAY);
+            stat_flush_us_ += t1 - t0;
+            stat_render_us_ += t2 - t1;
+            if (k == 0) stat_rows_ += yb1 - y;
+            stat_px_ += (yb1 - y) * w;
         }
-        if (w == width_) DrawOverlays(buf, y, yb1);   // (clipped bands have no overlays)
-        int64_t t2 = esp_timer_get_time();
-        FlushJob job = {buf, x0, y, x1, yb1};
-        xQueueSend(flush_q_, &job, portMAX_DELAY);
-        stat_flush_us_ += t1 - t0;
-        stat_render_us_ += t2 - t1;
-        stat_rows_ += yb1 - y;
-        stat_px_ += (yb1 - y) * w;
     }
 }
 
@@ -647,50 +622,11 @@ void AvatarDisplay::DrawText(uint16_t* band, int y0, int y1, const std::string& 
 }
 
 void AvatarDisplay::DrawVolumeArc(uint16_t* band, int y0, int y1) {
-    // The level in the avatar's own language: the bone rim turns amber clockwise from 12 o'clock
-    // up to the volume, like the timer's tide sweep; the rest of the rim dims to slate.
-    const float R = width_ / 2.0f, rim = width_ * kRimFrac, rc = R - rim / 2;
-    const float ro = R + 0.5f, ri = R - rim - 1;
-    const float sweep = 2 * kPi * volume_shown_ / 100.0f;
-    // Clockwise from 12 o'clock up to `sweep`, by cross products with the sweep's direction.
-    const float wx = sinf(sweep), wy = -cosf(sweep);
-    const bool big = sweep > kPi;
-    for (int y = y0; y < y1; y++) {
-        float dy = y + 0.5f - R;
-        if (fabsf(dy) >= ro) continue;
-        float xo = FastSqrt(ro * ro - dy * dy), xi = fabsf(dy) < ri ? FastSqrt(ri * ri - dy * dy) : 0;
-        uint16_t* row = band + (y - y0) * width_;
-        int spans[2][2] = {{(int)(R - xo), (int)(R - xi) + 1}, {(int)(R + xi), (int)(R + xo) + 1}};
-        for (auto& s : spans) {
-            for (int x = std::max(0, s[0]); x < std::min(width_, s[1]); x++) {
-                float dx = x + 0.5f - R, d = FastSqrt(dx * dx + dy * dy);
-                float cov = std::clamp(rim / 2 - fabsf(d - rc) + 0.5f, 0.0f, 1.0f);
-                if (cov <= 0) continue;
-                float cr = dx * wy - dy * wx;   // > 0: the sweep direction is clockwise of (dx, dy)
-                bool lit = big ? !(dx < 0 && cr < 0) : (dx >= 0 && cr >= 0);
-                if (lit) Blend(&row[x], kAmber, cov);
-                else Blend(&row[x], kSlate, cov * 0.8f);
-            }
-            if (xi == 0) break;   // the two spans merged at the top/bottom
-        }
-    }
+    porthole_volume_arc(band, width_, y0, y1, volume_shown_);   // avatar_overlay.h
 }
 
 void AvatarDisplay::RimArcRows(float a, float b, int* y0, int* y1) {
-    // Panel rows of the rim sector between angles a and b (clockwise from 12 o'clock).
-    const float R = width_ / 2.0f, rim = width_ * kRimFrac, ri = R - rim - 1, ro = R + 0.5f;
-    const float lo = std::min(a, b), hi = std::max(a, b);
-    float ymin = 1e9f, ymax = -1e9f;
-    for (float th : {lo, hi})
-        for (float rr : {ri, ro}) {
-            float y = R - rr * cosf(th);
-            ymin = std::min(ymin, y);
-            ymax = std::max(ymax, y);
-        }
-    if (lo <= 0 || hi >= 2 * kPi) ymin = R - ro;
-    if (lo <= kPi && hi >= kPi) ymax = R + ro;
-    *y0 = std::max(0, (int)floorf(ymin) - 2);
-    *y1 = std::min(height_, (int)ceilf(ymax) + 3);
+    porthole_rim_arc_rows(width_, height_, a, b, y0, y1);
 }
 
 void AvatarDisplay::DrawOverlays(uint16_t* band, int y0, int y1) {
@@ -746,7 +682,7 @@ void AvatarDisplay::RenderLoop() {
         int a0, a1;
         ActiveRows(&a0, &a1);
         bool full = force_full_ || sig != static_sig_ || osig != overlay_sig_;
-        avatar_dirty_shape(&av_, &shape_);
+        avatar_dirty_shape(&av_, &frame_, &shape_);
         if (full) shape_prev_ = shape_;
         struct Span { int a, b; } spans[4];
         int nspans = 0;
