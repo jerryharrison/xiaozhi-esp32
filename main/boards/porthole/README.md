@@ -49,10 +49,15 @@ comes from `PortholeAudioCodec::OutputData` (RMS × 3.5 per 10 ms, like the brid
 Rendering, at full resolution (466 px) and about 30 fps (10 fps in power save):
 
 - Rows that can change are redrawn (`avatar_dirty.h`): the horizon band, the light's reach and,
-  on the rim, the timer sweep and the volume level. Each is unioned with the previous frame, and
+  on the rim, the timer sweep. Each is unioned with the previous frame, and
   the frame is redrawn in full when the sea/rim colours or overlays change. Away from the horizon
   only the light's reach circle and the tap ripples' rings change, so those bands send just their
   columns (`avatar_band_spans`: the circle's chord plus each ring's chords, up to 4 spans a band).
+- When a rim arc's end moves (the volume level, a card's progress) only the box of the rim sector
+  between the old and new end is redrawn (`porthole_rim_arc_box`), and the volume number only its
+  own box. The arc itself (`porthole_rim_arc`) sorts ring pixels by squared distance: fully covered
+  pixels are a plain store (amber) or a cached blend (slate), and only the antialiased pixels at the
+  ring's edges take a square root and a blend.
 - Bands of 16 rows go into three internal DMA buffers. Both cores, at priority 1 (below audio,
   wake word and networking), take a band's rows one at a time. A small flush task (priority 9,
   nearly idle) hands finished bands to the QSPI panel, so neither core waits on `draw_bitmap`.
@@ -62,14 +67,18 @@ Rendering, at full resolution (466 px) and about 30 fps (10 fps in power save):
   full renders pixel for pixel (every mood, a timer, rapid taps).
 - `tools/arc_check.c` does the same with the volume arc showing (drags 0→100→0, every level held,
   taps), and fails if bone rim shows through the arc anywhere. `-DPORTHOLE_ARC_LEGACY=1` builds the
-  pre-fix arc, which must fail (it left the rim bone just right of 12 and 6 o'clock).
+  pre-fix arc, which must fail (it left the rim bone just right of 12 and 6 o'clock). It also checks
+  the fast arc against the old per-pixel arc (identical pixels) and that every pixel a level change
+  touches lies inside `porthole_rim_arc_box`.
 
 Measured with a temporary state cycle in a test build: steady 29.6, listening 27.5, working 29.7,
 speaking with a voice level 29.6, storm 29.6, star 29, timer 29.7, and one tap ripple at a time
 25 fps. A tap every 0.5 s gives about 23 fps.
 
-If full-resolution frames average over 55 ms, the display switches to half resolution (233 px,
-pixel-doubled). Every 5 s it logs `AvatarDisplay: N fps, render X ms ...`.
+If full-resolution frames average over 55 ms for 5 s, the display switches to half resolution (233 px,
+pixel-doubled). It goes back to full resolution once frames have averaged under 22 ms for 3 s in a
+row (judged each second); if it trips again within 30 s, the wait doubles, up to 60 s. Every 5 s it
+logs `AvatarDisplay: N fps, render X ms (overlays Y) ...`.
 
 ## Glance cards
 
@@ -88,6 +97,9 @@ Dwell defaults: glance 6 s, message 10 s, call until answered, timer until clear
 Cards arrive two ways: pushed on the bridge WebSocket during a conversation (`{"type":"card",…}`,
 `Application` → `ShowCard`), and between conversations by polling `GET <bridge>/xiaozhi/cards/`
 (the OTA URL with `ota/` → `cards/`, the WebSocket token, every `poll` s; 120 s in power save).
+The poll runs in its own task at idle priority: the HTTPS handshake costs 1.5-2 s of CPU, and above
+the render tasks it stalled a frame for that long. It shares no lock with rendering; the reply is
+handed over as a string and parsed in the render task.
 Touch results go to `POST …/cards/event`. Deadlines (`ends_at`, `expires_at`) are converted with
 the message's `now`, since the device clock is set to local time. Not yet: the bridge doesn't play
 a message or connect a call on tap (it gets the event); the curved rim hint text is straight here.
